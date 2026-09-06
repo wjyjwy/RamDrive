@@ -58,8 +58,11 @@ jobs:
       - name: Test
         shell: pwsh
         run: |
+          # Match ci.yml coverage: unit + integration (incl. the ACL/security
+          # failure-path tests) gate the release, not just the core unit suite.
           $projects = @(
-            "tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj"
+            "tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj",
+            "tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj"
           )
           $failed = $false
           foreach ($proj in $projects) {
@@ -67,6 +70,18 @@ jobs:
             if ($LASTEXITCODE -ne 0) { $failed = $true }
           }
           if ($failed) { exit 1 }
+
+      - name: Test (DifferentialChecker)
+        shell: pwsh
+        env:
+          RAMDRIVE_DIFF: "1"
+        run: |
+          # Behavioural parity gate: production adapter vs MemfsReferenceFs. Throws on
+          # the first divergence. ChaosTests excluded (long random fuzz).
+          dotnet test tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj `
+            -c Release --no-build --verbosity normal `
+            --filter "FullyQualifiedName!~ChaosTests"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Publish AOT executable (x64)
         shell: pwsh

@@ -76,12 +76,27 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         _options = options.Value;
         _logger = logger;
 
-        // Set root directory security descriptor so WinFsp enforces ACLs
+        // Set root directory security descriptor so WinFsp enforces ACLs — but ONLY when
+        // the root does not already have one. On a fresh mount the tree is brand-new
+        // (root SD is null) so we install the default; on a fast reload the adapter is
+        // rebuilt around an EXISTING filesystem and the (possibly user-modified) root SD
+        // must be preserved.
+        if (fs.RootSecurityDescriptor == null)
+        {
+            var sd = new RawSecurityDescriptor(RootSddl);
+            var bytes = new byte[sd.BinaryLength];
+            sd.GetBinaryForm(bytes, 0);
+            _fs.SetRootSecurityDescriptor(bytes);
+        }
+        _rootSecurityDescriptorBytes = RootSecurityDescriptorBytes();
+    }
+
+    private byte[] RootSecurityDescriptorBytes()
+    {
         var sd = new RawSecurityDescriptor(RootSddl);
         var bytes = new byte[sd.BinaryLength];
         sd.GetBinaryForm(bytes, 0);
-        _fs.SetRootSecurityDescriptor(bytes);
-        _rootSecurityDescriptorBytes = bytes;
+        return bytes;
     }
 
     // ═══════════════════════════════════════════

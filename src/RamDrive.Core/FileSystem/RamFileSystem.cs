@@ -32,6 +32,9 @@ public sealed class RamFileSystem : IDisposable
     public long UsedBytes => _pool.UsedBytes;
     public long FreeBytes => _pool.FreeBytes;
 
+    /// <summary>Root directory security descriptor (null until SetRootSecurityDescriptor).</summary>
+    internal byte[]? RootSecurityDescriptor => _root.SecurityDescriptor;
+
     /// <summary>
     /// Resolve a path to a FileNode. Returns null if not found.
     /// Path uses backslash separator (Dokan convention). "\" is root.

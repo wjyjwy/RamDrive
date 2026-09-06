@@ -151,24 +151,19 @@ internal sealed class WinFspHostedService : BackgroundService
         {
             var old = _session;
             if (old == null) return; // not mounted (startup failed) — nothing to reload
+            if (old.Host == null) return;
 
-            _logger.LogInformation("Reloading RAM disk with current configuration...");
-            var snapshot = old.Fs.CreateSnapshot(); // step 1: capture state (in RAM)
-
-            // Step 2: try to build + restore the NEW session while the old one still serves.
-            // Any failure here (invalid config, capacity too small) aborts with zero impact
-            // on the running volume.
-            Session fresh;
+            RamDriveOptions opts;
             try
             {
-                var opts = _optionsMonitor.CurrentValue;
-                if (opts.Validate().Count > 0) // PagePool throws too, but fail fast with detail
+                opts = _optionsMonitor.CurrentValue;
+                var errors = opts.Validate();
+                if (errors.Count > 0)
                 {
                     _logger.LogError("Reload aborted — invalid configuration: {Errors}",
-                        string.Join("; ", opts.Validate()));
+                        string.Join("; ", errors));
                     return;
                 }
-                fresh = CreateSession(opts);
             }
             catch (Exception ex)
             {
@@ -176,46 +171,127 @@ internal sealed class WinFspHostedService : BackgroundService
                 return;
             }
 
-            var restoreError = fresh.Fs.RestoreSnapshot(snapshot);
-            if (restoreError != null)
+            _logger.LogInformation("Reloading RAM disk with current configuration...");
+
+            // Fast path: the page layout (page size / capacity) is unchanged, so the
+            // existing tree AND page pool are reused as-is — the adapter (volume label,
+            // kernel-cache flags, mount point) and the host are the only things swapped.
+            // This is ZERO data copies: no snapshot, no restore. Applies to the most
+            // common edits (MountPoint, VolumeLabel, EnableKernelCache, FileInfoTimeoutMs,
+            // InitialDirectories). If it fails, the old filesystem object is still alive
+            // and we fall through to the snapshot path with no data loss.
+            if (opts.PageSizeKb == old.Options.PageSizeKb &&
+                opts.CapacityMb == old.Options.CapacityMb)
             {
-                _logger.LogError("Reload aborted — snapshot does not fit: {Error}. Old volume unchanged.", restoreError);
-                fresh.Dispose();
-                return;
+                if (ReloadFastPath(old, opts)) return;
+                _logger.LogWarning("Fast reload failed — falling back to full snapshot reload");
             }
 
-            // Step 3: commit — unmount the old session (freeing the old MountPoint) ...
-            try
-            {
-                old.Host?.Dispose();
-                old.Fs.Dispose();
-                old.Pool.Dispose();
-            }
-            catch (Exception ex)
-            {
-                // Data is safe (snapshot is in RAM); surface and continue so the new
-                // session can still be mounted.
-                _logger.LogWarning(ex, "Error disposing old session during reload");
-            }
-
-            // Step 4: mount the fresh, pre-restored session.
-            if (!MountSession(fresh))
-            {
-                _logger.LogError("Reload failed — new session could not be mounted; data is preserved in memory");
-                fresh.Dispose();
-                _session = null;
-                return;
-            }
-
-            CreateInitialDirectories(fresh);
-            _session = fresh;
-            _logger.LogInformation("Reload complete: {FileCount} files/directories restored, capacity={CapacityMb}MB pageSize={PageSizeKb}KB",
-                CountNodes(snapshot.Root), fresh.Options.CapacityMb, fresh.Options.PageSizeKb);
+            await ReloadFullPathAsync(old, opts);
         }
         finally
         {
             _reloadLock.Release();
         }
+    }
+
+    /// <summary>
+    /// Re-mount the existing filesystem+pools with a new adapter (no data copies).
+    /// Returns true on success. On failure the old filesystem/pool objects are left
+    /// alive so the caller can fall back to the snapshot path.
+    /// </summary>
+    private bool ReloadFastPath(Session old, RamDriveOptions opts)
+    {
+        // Rebuild the adapter around the SAME filesystem. The adapter constructor keeps
+        // the root security descriptor when it already exists (fast-reload contract).
+        var newAdapter = new WinFspRamAdapter(
+            old.Fs,
+            Options.Create(opts),
+            _loggerFactory.CreateLogger<WinFspRamAdapter>());
+        var pending = new Session { Pool = old.Pool, Fs = old.Fs, Adapter = newAdapter, Options = opts };
+
+        // Unmount the old host; tree + pages keep living in memory.
+        try
+        {
+            old.Host?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error unmounting old session during fast reload");
+        }
+
+        if (!MountSession(pending))
+        {
+            _logger.LogError("Fast reload failed — new mount did not succeed");
+            return false; // old.Fs / old.Pool still alive → snapshot fallback owns disposal
+        }
+
+        CreateInitialDirectories(pending);
+        _session = pending;
+        _logger.LogInformation("Fast reload complete (zero data copies): capacity={CapacityMb}MB pageSize={PageSizeKb}KB",
+            opts.CapacityMb, opts.PageSizeKb);
+        return true;
+    }
+
+    /// <summary>
+    /// Full reload: snapshot the whole volume into memory, rebuild a fresh session from
+    /// the new configuration, restore, then swap mounts. Used when the page layout
+    /// changed (capacity / page size) — the data must be re-chunked into the new pool.
+    /// Every step before the unmount keeps the old volume live and fails safe.
+    /// </summary>
+    private async Task ReloadFullPathAsync(Session old, RamDriveOptions opts)
+    {
+        var snapshot = old.Fs.CreateSnapshot(); // step 1: capture state (in RAM)
+
+        // Step 2: try to build + restore the NEW session while the old one still serves.
+        // Any failure here (invalid config, capacity too small) aborts with zero impact
+        // on the running volume.
+        Session fresh;
+        try
+        {
+            fresh = CreateSession(opts);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Reload aborted — could not build a new session from current configuration");
+            return;
+        }
+
+        var restoreError = fresh.Fs.RestoreSnapshot(snapshot);
+        if (restoreError != null)
+        {
+            _logger.LogError("Reload aborted — snapshot does not fit: {Error}. Old volume unchanged.", restoreError);
+            fresh.Dispose();
+            return;
+        }
+
+        // Step 3: commit — unmount the old session (freeing the old MountPoint) ...
+        try
+        {
+            old.Host?.Dispose();
+            old.Fs.Dispose();
+            old.Pool.Dispose();
+        }
+        catch (Exception ex)
+        {
+            // Data is safe (snapshot is in RAM); surface and continue so the new
+            // session can still be mounted.
+            _logger.LogWarning(ex, "Error disposing old session during reload");
+        }
+
+        // Step 4: mount the fresh, pre-restored session.
+        if (!MountSession(fresh))
+        {
+            _logger.LogError("Reload failed — new session could not be mounted; data is preserved in memory");
+            fresh.Dispose();
+            _session = null;
+            return;
+        }
+
+        CreateInitialDirectories(fresh);
+        _session = fresh;
+        _logger.LogInformation("Reload complete: {FileCount} files/directories restored, capacity={CapacityMb}MB pageSize={PageSizeKb}KB",
+            CountNodes(snapshot.Root), fresh.Options.CapacityMb, fresh.Options.PageSizeKb);
     }
 
     private static int CountNodes(NodeSnapshot n) =>
