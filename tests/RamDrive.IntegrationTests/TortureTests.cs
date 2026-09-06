@@ -36,7 +36,12 @@ public class TortureTests(RamDriveFixture fx) : IDisposable
             using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, block))
                 for (long o = 0; o < fileSize; o += block) { Fill(buf, id, o); fs.Write(buf); }
             using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, block))
-                for (long o = 0; o < fileSize; o += block) { fs.Read(buf); Verify(buf, id, o, $"seq {id}"); }
+                for (long o = 0; o < fileSize; o += block)
+                {
+                    int r = 0;
+                    while (r < block) { int n = fs.Read(buf, r, block - r); if (n == 0) break; r += n; }
+                    Verify(buf.AsSpan(0, r), id, o, $"seq {id}");
+                }
         })));
     }
 

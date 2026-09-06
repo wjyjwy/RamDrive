@@ -35,7 +35,7 @@ if %errorlevel% equ 0 (
 :: ============================================================
 ::  2. Download WinFsp MSI
 :: ============================================================
-set "WINFSP_VERSION=2.1.25079"
+set "WINFSP_VERSION=2.1.25156"
 set "WINFSP_MSI=winfsp-%WINFSP_VERSION%.msi"
 set "WINFSP_URL=https://github.com/winfsp/winfsp/releases/download/v2.1/%WINFSP_MSI%"
 set "WINFSP_PATH=%TEMP%\%WINFSP_MSI%"

@@ -54,6 +54,7 @@ public sealed class RamFileSystem : IDisposable
         {
             var (parent, name) = ResolvePath(path);
             if (parent == null || !parent.IsDirectory || name == null) return null;
+            if (!WindowsNameRules.IsValid(name)) return null;
             if (parent.Children!.ContainsKey(name)) return null;
 
             var node = FileNode.CreateFile(name, _pool);
@@ -78,6 +79,7 @@ public sealed class RamFileSystem : IDisposable
         {
             var (parent, name) = ResolvePath(path);
             if (parent == null || !parent.IsDirectory || name == null) return null;
+            if (!WindowsNameRules.IsValid(name)) return null;
             if (parent.Children!.ContainsKey(name)) return null;
 
             var node = FileNode.CreateDirectory(name);
@@ -125,12 +127,43 @@ public sealed class RamFileSystem : IDisposable
 
             var (newParent, newName) = ResolvePath(newPath);
             if (newParent == null || !newParent.IsDirectory || newName == null) return false;
+            if (!WindowsNameRules.IsValid(newName)) return false;
+
+            // P0-3: reject moving a node into itself or one of its own descendants.
+            // That would create a Parent/Children cycle — the subtree becomes unreachable
+            // and FileNode.Dispose recurses forever at unmount. The Win32 layer blocks the
+            // obvious case, but a case-only variant ("\a" → "\A\inner\newa") falls through
+            // to us, so the check MUST live inside the filesystem (see 0.4.7 live-test).
+            for (var p = newParent; p != null; p = p.Parent)
+            {
+                if (ReferenceEquals(p, sourceNode))
+                    return false;
+            }
 
             if (newParent.Children!.TryGetValue(newName, out var existing))
             {
-                if (!replace) return false;
-                if (existing.IsDirectory && existing.Children!.Count > 0) return false;
-                existing.Dispose();
+                if (ReferenceEquals(existing, sourceNode))
+                {
+                    // Self-target (same path or a case-only rename like "\a" → "\A"):
+                    // NTFS treats this as a successful no-op, with or without the
+                    // replace flag. Crucially we must NOT dispose the source node —
+                    // that was the old use-after-dispose: 'existing.Dispose()' released
+                    // a node that was then re-attached to the tree, so any later I/O
+                    // on it threw ObjectDisposedException.
+                }
+                else if (!replace)
+                    return false;
+                else if (existing.IsDirectory)
+                {
+                    // P1-1: a file may never replace a directory, even an empty one
+                    // (NTFS returns ACCESS_DENIED and MemfsReferenceFs does the same —
+                    // differential parity requires identical behavior here).
+                    return false;
+                }
+                else
+                {
+                    existing.Dispose();
+                }
             }
 
             var oldParent = sourceNode.Parent;
@@ -161,6 +194,133 @@ public sealed class RamFileSystem : IDisposable
                 .OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
+    }
+
+    // ─── Snapshot / restore (reload support) ───
+    //
+    // The whole volume lives in RAM, so a reload can capture the full state into a
+    // FileSystemSnapshot, tear the old session down, build a fresh one from new
+    // configuration, then restore. No disk I/O and no external format involved —
+    // sparse regions stay sparse because only allocated pages are carried over.
+
+    /// <summary>
+    /// Capture the whole volume into an in-memory snapshot. Safe to call at any time;
+    /// the structure lock plus each file's reader lock make it internally consistent.
+    /// </summary>
+    public FileSystemSnapshot CreateSnapshot()
+    {
+        lock (_structureLock)
+        {
+            return new FileSystemSnapshot { Root = CaptureNode(_root) };
+        }
+    }
+
+    /// <summary>
+    /// Restore a snapshot into this filesystem. The filesystem must be empty (only the
+    /// root node) — callers build a fresh filesystem for the target. Returns an error
+    /// message on failure (capacity too small for the snapshot, etc.) or null on success.
+    /// A failed restore leaves the target filesystem in an undefined state; the caller
+    /// must dispose it (which never affects the snapshot or the source).
+    /// </summary>
+    public string? RestoreSnapshot(FileSystemSnapshot snapshot)
+    {
+        lock (_structureLock)
+        {
+            if (_root.Children!.Count > 0)
+                return "target filesystem is not empty";
+
+            // Capacity pre-check: each file can eventually occupy ceil(Length/pageSize)
+            // pages. Validating up front means we bail before mutating anything, so a
+            // reload that would exceed the new capacity never discards the old session.
+            long requiredPages = 0;
+            CountRequiredPages(snapshot.Root, ref requiredPages);
+            if (requiredPages > _pool.MaxPages)
+                return $"snapshot needs {requiredPages} pages but pool capacity is {_pool.MaxPages} pages";
+
+            if (snapshot.Root.SecurityDescriptor != null)
+                _root.SecurityDescriptor = snapshot.Root.SecurityDescriptor;
+            _root.CreationTime = snapshot.Root.CreationTime;
+            _root.LastWriteTime = snapshot.Root.LastWriteTime;
+            _root.LastAccessTime = snapshot.Root.LastAccessTime;
+
+            foreach (var child in snapshot.Root.Children)
+            {
+                var err = RestoreNode(child, _root);
+                if (err != null) return err;
+            }
+            return null;
+        }
+    }
+
+    private static NodeSnapshot CaptureNode(FileNode node)
+    {
+        var snap = new NodeSnapshot
+        {
+            Name = node.Name,
+            IsDirectory = node.IsDirectory,
+            Attributes = node.Attributes,
+            CreationTime = node.CreationTime,
+            LastWriteTime = node.LastWriteTime,
+            LastAccessTime = node.LastAccessTime,
+            SecurityDescriptor = node.SecurityDescriptor,
+            Length = node.Size,
+        };
+
+        if (node.IsDirectory)
+        {
+            foreach (var child in node.Children!.Values)
+                snap.Children.Add(CaptureNode(child));
+        }
+        else
+        {
+            node.Content!.EnumerateAllocatedData(snap.Content);
+        }
+        return snap;
+    }
+
+    private string? RestoreNode(NodeSnapshot snap, FileNode parent)
+    {
+        var node = snap.IsDirectory
+            ? FileNode.CreateDirectory(snap.Name)
+            : FileNode.CreateFile(snap.Name, _pool);
+
+        node.SecurityDescriptor = snap.SecurityDescriptor ?? parent.SecurityDescriptor;
+        node.Attributes = snap.Attributes;
+        node.CreationTime = snap.CreationTime;
+        node.LastWriteTime = snap.LastWriteTime;
+        node.LastAccessTime = snap.LastAccessTime;
+        node.Parent = parent;
+        parent.Children![snap.Name] = node;
+
+        if (snap.IsDirectory)
+        {
+            foreach (var child in snap.Children)
+            {
+                var err = RestoreNode(child, node);
+                if (err != null) return err;
+            }
+        }
+        else
+        {
+            var content = node.Content!;
+            if (!content.SetLength(snap.Length))
+                return $"file '{snap.Name}' length {snap.Length} exceeds remaining capacity";
+
+            foreach (var (offset, data) in snap.Content)
+            {
+                if (content.Write(offset, data.AsSpan()) != data.Length)
+                    return $"file '{snap.Name}': restore write at offset {offset} failed (disk full)";
+            }
+        }
+        return null;
+    }
+
+    private void CountRequiredPages(NodeSnapshot node, ref long pages)
+    {
+        if (!node.IsDirectory)
+            pages += (node.Length + _pool.PageSize - 1) / _pool.PageSize;
+        foreach (var child in node.Children)
+            CountRequiredPages(child, ref pages);
     }
 
     public void Dispose()

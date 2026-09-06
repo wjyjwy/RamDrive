@@ -5,8 +5,6 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RamDrive.Cli;
 using RamDrive.Core.Configuration;
-using RamDrive.Core.FileSystem;
-using RamDrive.Core.Memory;
 
 [assembly: SupportedOSPlatform("windows")]
 
@@ -17,8 +15,10 @@ try
         .UseContentRoot(AppContext.BaseDirectory)
         .ConfigureAppConfiguration((_, config) =>
         {
-            config.AddJsonFile("appsettings.jsonc", optional: false, reloadOnChange: false);
-            config.AddJsonFile("appsettings.dev.jsonc", optional: true, reloadOnChange: false);
+            // reloadOnChange: true so that editing appsettings.jsonc while the service is
+            // running triggers the debounced volume reload in WinFspHostedService.
+            config.AddJsonFile("appsettings.jsonc", optional: false, reloadOnChange: true);
+            config.AddJsonFile("appsettings.dev.jsonc", optional: true, reloadOnChange: true);
             config.AddCommandLine(args);
         })
         .ConfigureLogging((context, logging) =>
@@ -39,11 +39,12 @@ try
 
     builder.ConfigureServices((context, services) =>
     {
+        // Bind options from the "RamDrive" section (reloadOnChange: true above makes
+        // IOptionsMonitor fire when appsettings.jsonc is edited, which drives the
+        // debounced volume reload). WinFspHostedService constructs and owns the
+        // PagePool / RamFileSystem / WinFspRamAdapter per mount session so it can tear
+        // down and rebuild them on reload with new configuration.
         services.Configure<RamDriveOptions>(context.Configuration.GetSection("RamDrive"));
-
-        services.AddSingleton<PagePool>();
-        services.AddSingleton<RamFileSystem>();
-        services.AddSingleton<WinFspRamAdapter>();
         services.AddHostedService<WinFspHostedService>();
     });
 

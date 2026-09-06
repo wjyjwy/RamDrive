@@ -72,6 +72,10 @@ Edit `appsettings.jsonc` or override via command line (`--RamDrive:CapacityMb=40
 }
 ```
 
+#### Reload on config change
+
+Editing `appsettings.jsonc` while the service runs triggers an automatic, debounced **volume reload**: the current filesystem is captured as an in-memory snapshot (no disk I/O; sparse regions stay sparse), a fresh session is built from the new configuration (new capacity / page size / mount point), the snapshot is restored into it and the drive re-mounts. If the new configuration is invalid or the snapshot doesn't fit the new capacity, the reload aborts and the running volume is left untouched. Volume contents are preserved across the reload.
+
 ## Formal Verification
 
 The core concurrency protocol is formally verified with [TLA+](https://lamport.azurewebsted.net/tla/tla.html) and the TLC model checker.

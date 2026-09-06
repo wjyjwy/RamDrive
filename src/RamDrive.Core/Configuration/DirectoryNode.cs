@@ -61,6 +61,26 @@ public sealed class DirectoryNode : Dictionary<string, DirectoryNode>
                 errors.Add($"  - \"{displayPath}\": name exceeds 255 characters");
             }
 
+            bool hasControlChar = false;
+            foreach (char c in name)
+            {
+                if (c < ' ' || c == '\u007F')
+                {
+                    hasControlChar = true;
+                    break;
+                }
+            }
+
+            if (!nameInvalid && hasControlChar)
+            {
+                errors.Add($"  - \"{displayPath}\": contains control character(s)");
+            }
+
+            if (!nameInvalid && (name.EndsWith('.') || name.EndsWith(' ')))
+            {
+                errors.Add($"  - \"{displayPath}\": ends with '.' or ' ' (invalid on Windows)");
+            }
+
             // Always validate children so the user sees all errors at once
             if (children.Count > 0)
                 ValidateRecursive(children, displayPath, errors, depth + 1);

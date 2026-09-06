@@ -126,6 +126,9 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     public void Unmounted(FileSystemHost host)
     {
         _logger.LogInformation("Drive unmounted");
+        // Drop the host reference so any straggler Notify() after unmount no-ops
+        // instead of issuing a kernel IOCTL against a stopped dispatcher.
+        _host = null;
     }
 
     // ═══════════════════════════════════════════
@@ -187,6 +190,12 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     // which WinFsp maps to Win32 ERROR_INVALID_OWNER (1307).
     private const int STATUS_INVALID_OWNER = unchecked((int)0xC000005A);
 
+    // STATUS_INVALID_SECURITY_DESCRIPTOR = 0xC0000058 (no NtStatus constant available).
+    private const int STATUS_INVALID_SECURITY_DESCRIPTOR = unchecked((int)0xC0000058);
+
+    // Conservative failure for unhandled callback exceptions (STATUS_UNSUCCESSFUL).
+    private const int STATUS_UNSUCCESSFUL = unchecked((int)0xC0000001);
+
     /// <summary>
     /// Approximate NTFS owner-assignment privilege enforcement. WinFsp does not surface the caller
     /// token to the SetSecurity callback (kernel <c>Req.SetSecurity</c> has no AccessToken field and
@@ -231,8 +240,13 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             var dir = _fs.CreateDirectory(fileName, securityDescriptor);
             if (dir == null)
             {
-                FsTracer.Trace("CreateFile-Dir-Coll", fileName);
-                return V(CreateResult.Error(NtStatus.ObjectNameCollision));
+                if (_fs.FindNode(fileName) != null)
+                {
+                    FsTracer.Trace("CreateFile-Dir-Coll", fileName);
+                    return V(CreateResult.Error(NtStatus.ObjectNameCollision));
+                }
+                FsTracer.Trace("CreateFile-Dir-PathNF", fileName);
+                return V(CreateResult.Error(NtStatus.ObjectPathNotFound));
             }
 
             info.Context = dir;
@@ -298,13 +312,18 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node?.Content == null)
             return V(FsResult.Error(NtStatus.ObjectNameNotFound));
 
+        // P0-2: check capacity BEFORE truncating. The old order (SetLength(0) first)
+        // silently destroyed the original file when the hinted allocation didn't fit:
+        // the caller saw DISK_FULL and assumed the overwrite never happened, but the
+        // data was already gone.
+        if (allocationSize > 0 && (long)allocationSize > _fs.FreeBytes)
+        {
+            FsTracer.Trace("OverwriteFile-DiskFull", info.FileName ?? "", $"alloc={allocationSize}");
+            return V(FsResult.Error(NtStatus.DiskFull));
+        }
+
         long sizeBefore = node.Content.Length;
         node.Content.SetLength(0);
-
-        // Early capacity check: if the caller hints at the final file size,
-        // fail fast before the copy begins rather than mid-write.
-        if (allocationSize > 0 && (long)allocationSize > _fs.FreeBytes)
-            return V(FsResult.Error(NtStatus.DiskFull));
 
         if (replaceFileAttributes && fileAttributes != 0)
             node.Attributes = (FileAttributes)fileAttributes;
@@ -454,6 +473,20 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             long additional = (long)newSize - node.Size;
             if (additional > 0 && additional > _fs.FreeBytes)
                 return V(FsResult.Error(NtStatus.DiskFull));
+
+            // P1-2: shrinking the allocation size must also shrink the logical size —
+            // NTFS and MemfsReferenceFs.SetFileSizeInternal both do
+            // `if (FileSize > newSize) FileSize = newSize`. Keeping FileSize unchanged
+            // diverges from the differential oracle and leaves cached applications with
+            // stale (too large) sizes.
+            if ((long)newSize < node.Content.Length)
+            {
+                if (!node.Content.SetLength((long)newSize))
+                    return V(FsResult.Error(NtStatus.DiskFull));
+                node.LastWriteTime = DateTime.UtcNow;
+                Notify(FileNotify.ChangeSize | FileNotify.ChangeLastWrite, FileNotify.ActionModified, fileName);
+            }
+
             FsTracer.Trace("SetFileSize-Alloc", fileName, $"newSize={newSize} curSize={node.Size}");
             return V(FsResult.Success(MakeFileInfo(node)));
         }
@@ -492,7 +525,20 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         // the no-null-SD structural invariant means this should be unreachable). Threading the same
         // bytes into both the owner-change guard and the merge keeps them consistent.
         byte[] currentSd = node.SecurityDescriptor ?? _rootSecurityDescriptorBytes;
-        var modification = new RawSecurityDescriptor(modificationDescriptor, 0);
+
+        // P1-4: a malformed / maliciously constructed descriptor must be rejected, not thrown
+        // into the WinFsp dispatcher (an unhandled exception there surfaces to every open handle).
+        RawSecurityDescriptor modification;
+        try
+        {
+            modification = new RawSecurityDescriptor(modificationDescriptor, 0);
+        }
+        catch (Exception ex) when (ex is ArgumentException or FormatException)
+        {
+            FsTracer.Trace("SetFileSecurity-BadSd", fileName, $"len={modificationDescriptor.Length}");
+            _logger.LogDebug(ex, "Malformed security descriptor rejected for {Path}", fileName);
+            return STATUS_INVALID_SECURITY_DESCRIPTOR;
+        }
 
         // NTFS oracle: a non-privileged caller cannot reassign the owner. WinFsp does not pass the
         // caller token here, so we approximate by rejecting any owner *change*. The failure is
@@ -572,10 +618,21 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         {
             // Capture IsDirectory BEFORE Delete disposes the node.
             bool wasDir = info.IsDirectory;
-            _fs.Delete(fileName);
-            FsTracer.Trace("Cleanup-Delete", fileName, $"isDir={wasDir} flags=0x{(uint)flags:X}");
-            Notify(wasDir ? FileNotify.ChangeDirName : FileNotify.ChangeFileName,
-                FileNotify.ActionRemoved, fileName);
+            // P1-5: only broadcast ActionRemoved when the deletion actually happened.
+            // Sending it unconditionally lets a failed delete (e.g. a child created
+            // between CanDelete and here) leave the kernel cache believing the file
+            // is gone while it still exists — the inverse of the staleness matrix
+            // this notification system exists to prevent.
+            if (_fs.Delete(fileName))
+            {
+                FsTracer.Trace("Cleanup-Delete", fileName, $"isDir={wasDir} flags=0x{(uint)flags:X}");
+                Notify(wasDir ? FileNotify.ChangeDirName : FileNotify.ChangeFileName,
+                    FileNotify.ActionRemoved, fileName);
+            }
+            else
+            {
+                FsTracer.Trace("Cleanup-Delete-Fail", fileName, "delete returned false");
+            }
         }
         else if (fileName != null)
         {
@@ -648,6 +705,12 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
 
         WinFspFileSystem.EndDirInfo(buffer, length, &bytesTransferred);
         return V(ReadDirectoryResult.Success(bytesTransferred));
+    }
+
+    public int ExceptionHandler(Exception ex)
+    {
+        _logger.LogError(ex, "Unhandled exception in WinFsp callback");
+        return STATUS_UNSUCCESSFUL;
     }
 
     // ═══════════════════════════════════════════

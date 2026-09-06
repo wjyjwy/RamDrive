@@ -148,14 +148,17 @@ public sealed class PagedFileContent : IDisposable
             preAllocatedCount = _pool.RentBatch(preAllocated, neededCount);
             if (preAllocatedCount < neededCount)
             {
-                // Not enough capacity — return what we got, restore reservations, and fail
+                // Not enough capacity — return what we got, then try to restore the
+                // reservation we briefly released. P1-3: only restore the file-level
+                // count when the pool can still honor it; if another writer claimed the
+                // capacity between our Unreserve and this failure, the reservation is
+                // genuinely gone and re-adding the file-level count here would let a
+                // later Unreserve drive the pool's committed counter negative. The
+                // file is left at its pre-write length; a later SetLength re-reserves.
                 if (preAllocatedCount > 0)
                     _pool.ReturnBatch(preAllocated, preAllocatedCount);
-                if (unreservedForAlloc > 0)
-                {
-                    _pool.Reserve(unreservedForAlloc);
+                if (unreservedForAlloc > 0 && _pool.Reserve(unreservedForAlloc))
                     Interlocked.Add(ref _reservedPages, unreservedForAlloc);
-                }
                 return -1;
             }
         }
@@ -248,6 +251,31 @@ public sealed class PagedFileContent : IDisposable
         finally
         {
             _lock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Copy every allocated page's contents into <paramref name="target"/> as
+    /// (page-start byte offset, page bytes) pairs. Sparse pages are skipped. Used by
+    /// <see cref="RamDrive.Core.FileSystem.RamFileSystem.CreateSnapshot"/> to keep file
+    /// data in memory across a reload.
+    /// </summary>
+    public unsafe void EnumerateAllocatedData(List<(long Offset, byte[] Data)> target)
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            for (int i = 0; i < _pages.Length; i++)
+            {
+                if (_pages[i] == nint.Zero) continue;
+                var copy = new byte[_pageSize];
+                new ReadOnlySpan<byte>((byte*)_pages[i], _pageSize).CopyTo(copy);
+                target.Add((i * (long)_pageSize, copy));
+            }
+        }
+        finally
+        {
+            _lock.ExitReadLock();
         }
     }
 

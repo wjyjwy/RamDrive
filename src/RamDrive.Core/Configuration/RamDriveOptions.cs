@@ -57,4 +57,35 @@ public sealed class RamDriveOptions
     /// Example: <c>{ "Temp": {}, "Cache": { "App1": {} } }</c>
     /// </summary>
     public DirectoryNode? InitialDirectories { get; set; }
+
+    /// <summary>
+    /// Validate this configuration. Returns a list of human-readable errors (empty = valid).
+    /// Called from the <c>PagePool</c> constructor; a failing volume refuses to start with
+    /// a descriptive message instead of crashing later with a divide-by-zero or negative
+    /// capacity (e.g. <c>PageSizeKb=0</c> or <c>CapacityMb=-1</c>).
+    /// </summary>
+    public List<string> Validate()
+    {
+        var errors = new List<string>();
+
+        if (string.IsNullOrWhiteSpace(MountPoint))
+            errors.Add("MountPoint must not be empty");
+
+        if (CapacityMb <= 0)
+            errors.Add($"CapacityMb must be positive (got {CapacityMb})");
+        else if (CapacityMb > 1_048_576) // 1 TB sanity cap
+            errors.Add($"CapacityMb is unreasonably large ({CapacityMb}); refusing to start");
+
+        if (PageSizeKb <= 0)
+            errors.Add($"PageSizeKb must be positive (got {PageSizeKb})");
+        else if (PageSizeKb > 1_048_576)
+            errors.Add($"PageSizeKb is unreasonably large ({PageSizeKb})");
+        else if (PageSizeKb > CapacityMb * 1024)
+            errors.Add($"PageSizeKb ({PageSizeKb}KB) exceeds capacity ({CapacityMb}MB) — pool would have fewer than 1 page");
+
+        if (VolumeLabel.Length > 32)
+            errors.Add($"VolumeLabel must be at most 32 characters (got {VolumeLabel.Length})");
+
+        return errors;
+    }
 }

@@ -392,6 +392,14 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
             if (!_nodes.TryGetValue(fileName, out var node))
                 return new(NtStatus.ObjectNameNotFound);
 
+            // LOCKSTEP with RamFileSystem.Move: reject moving a node into its own subtree.
+            // The flat map cannot form a cycle, but this also catches the case-only
+            // variants ("\a" → "\A\inner\newa") that bypass the Win32 layer, and the
+            // differential pair must agree on rejection or Comparators throws.
+            if (newFileName.Length > fileName.Length &&
+                MemfsFileNameComparer.HasPrefix(newFileName, fileName, true))
+                return new(NtStatus.ObjectNameInvalid);
+
             _nodes.TryGetValue(newFileName, out var newNode);
             if (newNode != null && !ReferenceEquals(node, newNode))
             {
@@ -571,7 +579,6 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
     private static FspFileInfo MkInfo(MemfsNode n) => new()
     {
         FileAttributes = n.FileAttributes,
-        ReparseTag = n.ReparseTag,
         AllocationSize = n.AllocationSize,
         FileSize = n.FileSize,
         CreationTime = n.CreationTime,
