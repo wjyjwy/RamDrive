@@ -1,8 +1,8 @@
 name: Release
 
 on:
-  push:
-    tags: ['release-*']
+  # 手动触发（Actions 页面点 "Run workflow" 并填写要发布的版本 tag）。
+  # release-* tag push 自动触发暂被禁用，原因同 ci.yml（fork 开启 Actions 前保持静默）。
   workflow_dispatch:
     inputs:
       tag:

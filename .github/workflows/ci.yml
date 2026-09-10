@@ -1,10 +1,16 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # 完全手动控制：只允许 workflow_dispatch（Actions 页面点 "Run workflow"，
+  # 或由维护者/自动化通过 API 对指定分支触发，可指定分支）。
+  #
+  # 意图：该仓库（fork）的云端环境会在文件变更后自动提交并 push 自己的工作分支，
+  # 因此任何「自动事件」都可能被环境自身的 push 误触发。为保证「不让我触发就绝不
+  # 运行」：
+  #   - 移除 push:[main]（main 自身 push 不触发，main 代码不跑测试）
+  #   - 移除 pull_request（PR 分支的更新也不自动触发）
+  # 需要验证时，点 "Run workflow" 并在分支下拉框里选择要测的分支即可。
+  workflow_dispatch:
 
 permissions:
   contents: read
