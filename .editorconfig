@@ -1,0 +1,29 @@
+# Formatting-only rules. Deliberately no IDE**** severity promotions here: those produce
+# compiler-level diagnostics, and src/ now builds with TreatWarningsAsErrors (see
+# src/Directory.Build.props), so adding them would need a dedicated cleanup pass first.
+# Ramp them up later, one rule at a time.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.{cs,csx}]
+indent_size = 4
+
+[*.{json,jsonc,props,targets,csproj,slnx,xml,yml,yaml}]
+indent_size = 2
+
+[*.md]
+indent_size = 2
+trim_trailing_whitespace = false
+
+[*.{iss}]
+indent_size = 2
+
+[*.tla]
+indent_size = 2

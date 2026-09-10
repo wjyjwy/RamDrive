@@ -56,12 +56,6 @@ public sealed class DifferentialAdapter : IFileSystem
     private static void SwapTo(FileOperationInfo info, object? ctx)
         => info.Context = ctx;
 
-    private static void SaveAndRestore(FileOperationInfo info, Pair pair, ref object? slot)
-    {
-        slot = info.Context;
-        info.Context = pair;
-    }
-
     public bool SynchronousIo => _ram.SynchronousIo;
 
     public int Init(FileSystemHost host)

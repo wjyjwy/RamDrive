@@ -80,8 +80,18 @@ public sealed class FileNode : IDisposable
     public bool IsDirectory => NodeType == FileNodeType.Directory;
     public bool IsFile => NodeType == FileNodeType.File;
 
+    /// <summary>
+    /// Releases this node's content and the whole subtree beneath it.
+    /// Idempotent and O(1) on a repeat call: a node can legitimately be disposed twice
+    /// (the reload fallback disposes a partially torn-down session, and this method
+    /// recurses every child), and the recursion is O(subtree). <see cref="PagedFileContent.Dispose"/>
+    /// already guards itself, but without the guard here the whole subtree walk is repeated.
+    /// </summary>
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+
         Content?.Dispose();
         if (Children != null)
         {
@@ -90,4 +100,6 @@ public sealed class FileNode : IDisposable
             Children.Clear();
         }
     }
+
+    private bool _disposed;
 }

@@ -5,6 +5,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <SupportedPlatform>windows</SupportedPlatform>
         <IsTestProject>true</IsTestProject>
     </PropertyGroup>
 

@@ -33,6 +33,15 @@ public sealed class RamDriveFixture : IDisposable
 
     public RamDriveFixture()
     {
+        // Differential mode (RAMDRIVE_DIFF=1) wraps the production adapter in
+        // DifferentialAdapter, which runs every mutation twice and compares the two.
+        // That is a SEMANTIC comparison — notification IOCTLs only add latency and
+        // thread-pool pressure to it. Measured on GitHub CI: with notifications on, the
+        // differential leg failed in 45s with ~46k divergences instead of passing after
+        // ~1020s, and the ordinary test leg slowed from 84s to 358s. So the differential
+        // leg runs with notifications off; the ordinary leg keeps them on.
+        bool differential = Environment.GetEnvironmentVariable("RAMDRIVE_DIFF") == "1";
+
         var options = new RamDriveOptions
         {
             CapacityMb = CapacityMb,
@@ -42,6 +51,13 @@ public sealed class RamDriveFixture : IDisposable
             // calls produce stale-cache test failures in CI rather than only against
             // real Chromium with the production default. See specs/cache-invalidation.
             FileInfoTimeoutMs = uint.MaxValue,
+            // ...and turn the notification matrix ON. With EnableNotifications=false the
+            // Notify() call early-returns, so the "worst-case timeout" above would catch
+            // nothing: a missing Notify would be indistinguishable from a correct one.
+            // The whole point of pinning uint.MaxValue is to make notifications the sole
+            // coherence mechanism, so this fixture must enable them — except in
+            // differential mode (see above).
+            EnableNotifications = !differential,
             VolumeLabel = "IntegrationTest",
         };
 

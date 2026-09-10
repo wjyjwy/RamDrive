@@ -6,7 +6,6 @@ internal sealed class MemfsNode
 {
     public string FileName = "";
     public uint FileAttributes;
-    public uint ReparseTag;
     public ulong AllocationSize;
     public ulong FileSize;
     public ulong CreationTime;

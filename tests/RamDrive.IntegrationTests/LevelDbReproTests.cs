@@ -65,7 +65,7 @@ internal static partial class LevelDbWin32
 }
 
 [Collection("RamDrive")]
-public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : IDisposable
+public class LevelDbReproTests(RamDriveFixture fx) : IDisposable
 {
     private readonly string _dir = Path.Combine(fx.Root, $"ldb_{Guid.NewGuid():N}");
 
@@ -118,16 +118,9 @@ public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : I
         bool ok = LevelDbWin32.ReadFile(hr, readBuf, (uint)readBuf.Length, out uint readBytes, 0);
         LevelDbWin32.CloseHandle(hr);
 
-        try
-        {
-            ok.Should().BeTrue();
-            readBytes.Should().Be((uint)payload.Length, "ReadFile after rename must return all 16 bytes; got {0}", readBytes);
-            readBuf.AsSpan(0, (int)readBytes).ToArray().Should().Equal(payload);
-        }
-        catch
-        {
-            throw;
-        }
+        ok.Should().BeTrue();
+        readBytes.Should().Be((uint)payload.Length, "ReadFile after rename must return all 16 bytes; got {0}", readBytes);
+        readBuf.AsSpan(0, (int)readBytes).ToArray().Should().Equal(payload);
     }
 
     /// <summary>
@@ -181,16 +174,9 @@ public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : I
         bool ok = LevelDbWin32.ReadFile(hr, readBuf, (uint)readBuf.Length, out uint readBytes, 0);
         LevelDbWin32.CloseHandle(hr);
 
-        try
-        {
-            ok.Should().BeTrue();
-            readBytes.Should().Be((uint)payload.Length, "Got {0} bytes (expected 16)", readBytes);
-            readBuf.AsSpan(0, (int)readBytes).ToArray().Should().Equal(payload);
-        }
-        catch
-        {
-            throw;
-        }
+        ok.Should().BeTrue();
+        readBytes.Should().Be((uint)payload.Length, "Got {0} bytes (expected 16)", readBytes);
+        readBuf.AsSpan(0, (int)readBytes).ToArray().Should().Equal(payload);
     }
 
     /// <summary>
@@ -232,17 +218,10 @@ public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : I
         bool ok = LevelDbWin32.ReadFile(hr, readBuf, (uint)readBuf.Length, out uint readBytes, 0);
         LevelDbWin32.CloseHandle(hr);
 
-        try
-        {
-            ok.Should().BeTrue();
-            readBytes.Should().Be((uint)payload.Length,
-                "mixed-case path must invalidate the upper-cased FSD cache key; got {0} bytes", readBytes);
-            readBuf.AsSpan(0, (int)readBytes).ToArray().Should().Equal(payload);
-        }
-        catch
-        {
-            throw;
-        }
+        ok.Should().BeTrue();
+        readBytes.Should().Be((uint)payload.Length,
+            "mixed-case path must invalidate the upper-cased FSD cache key; got {0} bytes", readBytes);
+        readBuf.AsSpan(0, (int)readBytes).ToArray().Should().Equal(payload);
     }
 }
 

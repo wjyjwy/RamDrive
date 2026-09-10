@@ -13,7 +13,7 @@
 ;   .msi is bundled regardless of MyAppArch.
 
 #define MyAppName      "RamDrive"
-#define MyAppVersion   "0.0.0-dev"
+#define MyAppVersion   "1.0.0-dev"
 #define MyAppPublisher "HYProjects"
 #define MyAppExeName   "RamDrive.exe"
 #define MyAppURL       "https://github.com/hooyao/RamDrive"
@@ -838,6 +838,17 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+
+  // Enable Mount Manager BEFORE WinFsp is installed/reinstalled. WinFsp's kernel
+  // driver (winfsp.sys) reads MountUseMountmgrFromFSD exactly once, at DriverEntry.
+  // Writing it here — before msiexec (re)registers and loads the driver — means the
+  // fresh driver already sees 1, so the very first service start mounts through the
+  // Mount Manager with no warning. Writing it only in ssPostInstall (after the driver
+  // is already loaded) is why a first run used to fall back to DefineDosDevice and
+  // "running RamDrive.exe once more" appeared to fix it: that second run only happened
+  // to follow a driver reload. Keep the ssPostInstall call as an idempotent backstop
+  // for the "WinFsp component not selected" path.
+  ConfigureWinFspMountManager;
 
   // Install WinFsp if selected and an equal-or-newer version isn't already
   // present. Done here (drive still mounted) — see note above.

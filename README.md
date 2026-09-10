@@ -65,6 +65,8 @@ Edit `appsettings.jsonc` or override via command line (`--RamDrive:CapacityMb=40
     "PreAllocate": false,           // true = allocate all memory at startup
     "VolumeLabel": "RamDrive",      // Volume label in Explorer
     "EnableKernelCache": true,      // Kernel page cache (~3x read throughput)
+    "FileInfoTimeoutMs": 1000,      // Kernel metadata cache lifetime in ms (0 = off)
+    "EnableNotifications": true,    // Cache-invalidation notify after mutations (keep on)
     "InitialDirectories": {         // Directories created on mount
       "Temp": {}                    //   e.g. { "Temp": {}, "Cache": { "App1": {} } }
     }
@@ -72,9 +74,13 @@ Edit `appsettings.jsonc` or override via command line (`--RamDrive:CapacityMb=40
 }
 ```
 
+#### Reload on config change
+
+Editing `appsettings.jsonc` while the service runs triggers an automatic, debounced **volume reload**: the current filesystem is captured as an in-memory snapshot (no disk I/O; sparse regions stay sparse), a fresh session is built from the new configuration (new capacity / page size / mount point), the snapshot is restored into it and the drive re-mounts. If the new configuration is invalid or the snapshot doesn't fit the new capacity, the reload aborts and the running volume is left untouched. Volume contents are preserved across the reload.
+
 ## Formal Verification
 
-The core concurrency protocol is formally verified with [TLA+](https://lamport.azurewebsted.net/tla/tla.html) and the TLC model checker.
+The core concurrency protocol is formally verified with [TLA+](https://lamport.azurewebsites.net/tla/tla.html) and the TLC model checker.
 
 **What's verified (`tla/RamDiskSystem.tla`):**
 
@@ -110,6 +116,32 @@ dotnet build
 # AOT publish (requires Visual Studio C++ Build Tools)
 dotnet publish src/RamDrive.Cli/RamDrive.Cli.csproj -c Release -r win-x64 -o ./publish-aot
 ```
+
+### Running the tests
+
+```bash
+# Unit tests — no WinFsp mount required, safe anywhere
+dotnet test tests/RamDrive.Core.Tests
+
+# Integration tests — REQUIRE a real WinFsp mount and a normally-launched console
+dotnet test tests/RamDrive.IntegrationTests
+```
+
+**Run the integration tests from an elevated PowerShell or cmd**, not from a restricted or
+tooling-spawned shell. In a constrained session every `Directory.CreateDirectory` /
+file-create on a freshly mounted volume can fail with `UnauthorizedAccessException`, which
+surfaces as ~42 spurious failures. The same calls succeed from a normally launched process
+on the same volume, so this is a session artifact, not a product defect.
+
+### Where the configuration actually lives
+
+The host calls `UseContentRoot(AppContext.BaseDirectory)`, so `appsettings.jsonc` is read
+from **the directory the executable sits in** — `C:\Program Files\RamDrive\` for an
+installed service, or the build output directory for a local run.
+
+Editing `src/RamDrive.Cli/appsettings.jsonc` therefore only affects a locally built binary.
+It does **not** reach an installed service, and it will **not** trigger a reload of a
+running service.
 
 ## Release
 

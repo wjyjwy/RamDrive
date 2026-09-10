@@ -1,0 +1,23 @@
+<Project>
+
+  <!-- Settings for PRODUCT code only (src/**). Tests intentionally keep warnings as
+       warnings: their analyzer hits (CA1416 platform guards, xUnit1031 blocking calls)
+       are informative rather than defects, and turning them into errors would just
+       mean blanket suppression attributes.
+
+       Import the repository-root Directory.Build.props explicitly: MSBuild stops at the
+       NEAREST Directory.Build.props, so without this <Import> the root Version/Product
+       would be silently dropped for every src/ project. -->
+  <Import Project="$(MSBuildThisFileDirectory)..\Directory.Build.props" />
+
+  <PropertyGroup>
+    <!-- src/ is warning-free today. Keep it that way: a new analyzer hit in product code
+         fails the build instead of scrolling past in CI output. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- ...except AOT/trimming diagnostics, which only surface on `dotnet publish -r <rid>`
+         and are triaged separately. Exempting them keeps the Release publish usable while
+         still failing the build on ordinary analyzer warnings. -->
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);IL2026;IL2104;IL3050;IL3053</WarningsNotAsErrors>
+  </PropertyGroup>
+
+</Project>
