@@ -94,6 +94,10 @@ public sealed class PagedFileContent : IDisposable
 
     /// <summary>
     /// Write data to the file from the source span. Returns bytes written, or -1 if out of disk space.
+    /// A write ending past the current EOF grows the logical length to <c>offset + source.Length</c>:
+    /// callers that must NOT extend the file (e.g. snapshot restore replaying whole page buffers
+    /// for a file whose length is not a page multiple) have to clip the span to the logical
+    /// length themselves.
     /// Pages are pre-allocated outside the write lock to minimize lock hold time.
     /// </summary>
     public unsafe int Write(long offset, ReadOnlySpan<byte> source)

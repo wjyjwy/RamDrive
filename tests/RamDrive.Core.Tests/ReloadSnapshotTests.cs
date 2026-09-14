@@ -180,4 +180,50 @@ public class ReloadSnapshotTests
         buf.Take(3).Should().Equal((byte)0x00, (byte)0x01, (byte)0x02);
         buf.Skip(3).Should().OnlyContain(b => b == 0xAB);
     }
+
+    [Fact]
+    public void RoundTrip_PreservesExactLogicalLength_WhenNotPageAligned()
+    {
+        // Regression: the restore wrote a full page (pageSize bytes) at a page-aligned offset,
+        // and PagedFileContent.Write grows the logical length to the end of the written span.
+        // Every file whose length was not a page multiple therefore came back padded with
+        // zeroes up to the page boundary ("null characters at the end of the file" after a
+        // capacity-only reload).
+        var (fs, pool) = NewFs();
+        using var _ = pool;
+        using var __ = fs;
+
+        var f = fs.CreateFile(@"\notes.txt")!;
+        var data = new byte[1000]; // not a page multiple
+        for (int i = 0; i < data.Length; i++) data[i] = (byte)('a' + i % 26);
+        f.Content!.Write(0, data).Should().Be(data.Length);
+
+        // Same, but the last page is only partially covered by data before the EOF.
+        var g = fs.CreateFile(@"\extended.bin")!;
+        g.Content!.Write(0, new byte[10]).Should().Be(10);
+        g.Content.Write(123, new byte[7]).Should().Be(7);   // still inside page 0
+        g.Content.SetLength(4096).Should().BeTrue();        // logical length beyond the written data
+
+        // Sparse file: length only, no allocated page at all.
+        var s = fs.CreateFile(@"\len-only.bin")!;
+        s.Content!.SetLength(100).Should().BeTrue();
+
+        var snapshot = fs.CreateSnapshot();
+
+        // Restore into a LARGER pool — the capacity-only edit that triggered the bug.
+        var (fs2, pool2) = NewFs(4);
+        using var _2 = pool2;
+        using var _3 = fs2;
+        pool2.CapacityBytes.Should().BeGreaterThan(pool.CapacityBytes);
+        fs2.RestoreSnapshot(snapshot).Should().BeNull();
+
+        fs2.FindNode(@"\notes.txt")!.Size.Should().Be(data.Length);
+        fs2.FindNode(@"\extended.bin")!.Size.Should().Be(4096);
+        fs2.FindNode(@"\len-only.bin")!.Size.Should().Be(100);
+
+        // Content is still byte-for-byte, and nothing is readable past the logical end.
+        var probe = new byte[data.Length + 8];
+        fs2.FindNode(@"\notes.txt")!.Content!.Read(0, probe).Should().Be(data.Length);
+        probe.Take(data.Length).Should().Equal(data);
+    }
 }

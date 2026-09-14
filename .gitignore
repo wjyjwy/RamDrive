@@ -192,6 +192,9 @@ FodyWeavers.xsd
 # RamDrive project-specific
 appsettings.dev.jsonc
 publish-aot/
+publish-aot-arm64/
+publish-fx/
+publish-fx-arm64/
 publish-test/
 installer-output/
 dokan-dotnet/

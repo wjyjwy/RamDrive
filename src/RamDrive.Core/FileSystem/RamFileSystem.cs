@@ -319,7 +319,18 @@ public sealed class RamFileSystem : IDisposable
 
             foreach (var (offset, data) in snap.Content)
             {
-                if (content.Write(offset, data.AsSpan()) != data.Length)
+                // Snapshot entries carry a whole page, but only the bytes inside the logical
+                // length may be replayed: PagedFileContent.Write() grows the length to the end
+                // of the written span, so writing the last page in full would pad every file
+                // whose length is not a page multiple with zeroes up to the page boundary —
+                // the "trailing null characters" seen in IDEs after a capacity reload. Bytes
+                // past EOF are read as zeroes anyway (unallocated pages and page tails are
+                // zero-filled), so clipping loses nothing.
+                long remaining = snap.Length - offset;
+                if (remaining <= 0) continue;
+
+                var chunk = data.AsSpan(0, (int)Math.Min(data.Length, remaining));
+                if (content.Write(offset, chunk) != chunk.Length)
                     return $"file '{snap.Name}': restore write at offset {offset} failed (disk full)";
             }
         }
