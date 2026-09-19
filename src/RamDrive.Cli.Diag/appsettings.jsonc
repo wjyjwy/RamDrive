@@ -34,14 +34,18 @@
     // Cache coherence relies on every IFileSystem callback returning the correct
     // post-operation FspFileInfo in its response (the kernel updates Cc from that).
     //   0           = cache disabled (same effect as EnableKernelCache=false)
-    //   4294967295  = uint.MaxValue, cache effectively permanent
+    //   4294967295  = uint.MaxValue, cache effectively permanent. Requires
+    //                 EnableNotifications=true (validated at startup), otherwise a
+    //                 cached entry can never expire and nothing invalidates it.
     "FileInfoTimeoutMs": 1000,
 
     // Send FspFileSystemNotify after every path-mutating callback (Create / Write /
-    // SetFileSize / SetFileAttributes / Rename / Delete). Default false: cache coherence
-    // is maintained by every callback returning the correct FileInfo, so notifications
-    // are redundant. Set to true only when debugging suspected cache-coherence regressions.
-    "EnableNotifications": false,
+    // SetFileSize / SetFileAttributes / Rename / Delete). Default true. Rename and delete
+    // have no FileInfo to return, so the notification is the only way the kernel learns a
+    // cached entry for a path is now wrong — this is what fixed the Chrome/leveldb profile
+    // corruption. Costs one kernel IOCTL per mutation, dispatched off the I/O thread.
+    // Set to false only if a metadata-heavy workload measurably regresses.
+    "EnableNotifications": true,
 
     // Directories to create automatically after mounting.
     // JSON keys are directory names; nested objects define subdirectories.
