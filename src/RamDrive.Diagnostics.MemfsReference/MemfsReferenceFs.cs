@@ -179,6 +179,114 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
         return !Equals(newOwner, curOwner);
     }
 
+    // ═══════════════════════════════════════════
+    //  Reparse points — 1:1 port of the MEMFS_REPARSE_POINTS block in tst/memfs/memfs.cpp
+    // ═══════════════════════════════════════════
+
+    private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+    private const uint REPARSE_GUID_DATA_BUFFER_HEADER_SIZE = 24;
+
+    /// <summary>
+    /// LOCKSTEP with RamDrive.Core.FileSystem.ReparsePointBuffer.CanReplace — same 1:1 port
+    /// of FspFileSystemCanReplaceReparsePoint. Kept private here so the oracle stays a
+    /// standalone project (no RamDrive.Core reference); DifferentialAdapter proves the two
+    /// agree on every Set/Delete instead.
+    /// </summary>
+    private static int CanReplaceReparsePoint(byte[]? current, int currentSize, byte[]? replace, int replaceSize)
+    {
+        if (current is null || replace is null || currentSize < 4 || replaceSize < 4)
+            return NtStatus.IoReparseDataInvalid;
+
+        uint currentTag = BitConverter.ToUInt32(current, 0);
+        if (currentTag != BitConverter.ToUInt32(replace, 0))
+            return NtStatus.IoReparseTagMismatch;
+
+        if ((currentTag & 0x80000000u) == 0
+            && currentSize >= REPARSE_GUID_DATA_BUFFER_HEADER_SIZE
+            && replaceSize >= REPARSE_GUID_DATA_BUFFER_HEADER_SIZE)
+        {
+            if (BitConverter.ToUInt32(current, 4) != BitConverter.ToUInt32(replace, 4)
+                || BitConverter.ToUInt16(current, 8) != BitConverter.ToUInt16(replace, 8)
+                || current[12] != replace[12]
+                || current[16] != replace[16])
+            {
+                return NtStatus.ReparseAttributeConflict;
+            }
+        }
+        else if ((currentTag & 0x80000000u) == 0)
+        {
+            return NtStatus.ReparseAttributeConflict;
+        }
+
+        return NtStatus.Success;
+    }
+
+    public int GetReparsePointByName(string fileName, bool isDirectory, ref byte[]? reparseData)
+    {
+        MemfsNode? n;
+        lock (_mapLock) _nodes.TryGetValue(fileName, out n);
+        if (n == null) return NtStatus.ObjectNameNotFound;
+        if (0 == (n.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+            return NtStatus.NotAReparse;
+        reparseData = n.ReparseData;
+        return NtStatus.Success;
+    }
+
+    public int GetReparsePoint(string fileName, ref byte[]? reparseData, FileOperationInfo info)
+    {
+        var n = N(info);
+        if (n == null) return NtStatus.ObjectNameNotFound;
+        if (0 == (n.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+            return NtStatus.NotAReparse;
+        reparseData = n.ReparseData;
+        return NtStatus.Success;
+    }
+
+    public int SetReparsePoint(string fileName, byte[] reparseData, FileOperationInfo info)
+    {
+        var n = N(info);
+        if (n == null) return NtStatus.ObjectNameNotFound;
+
+        lock (_mapLock)
+        {
+            if (HasChild(n))
+                return NtStatus.DirectoryNotEmpty;
+
+            if (n.ReparseData != null)
+            {
+                int r = CanReplaceReparsePoint(n.ReparseData, n.ReparseData.Length,
+                    reparseData, reparseData.Length);
+                if (r != NtStatus.Success) return r;
+            }
+
+            n.ReparseData = (byte[])reparseData.Clone();
+            n.FileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT;
+            n.ReparseTag = BitConverter.ToUInt32(reparseData, 0); // first field is the tag
+            return NtStatus.Success;
+        }
+    }
+
+    public int DeleteReparsePoint(string fileName, byte[] reparseData, FileOperationInfo info)
+    {
+        var n = N(info);
+        if (n == null) return NtStatus.ObjectNameNotFound;
+
+        lock (_mapLock)
+        {
+            if (n.ReparseData == null)
+                return NtStatus.NotAReparse;
+
+            int r = CanReplaceReparsePoint(n.ReparseData, n.ReparseData.Length,
+                reparseData, reparseData.Length);
+            if (r != NtStatus.Success) return r;
+
+            n.ReparseData = null;
+            n.ReparseTag = 0;
+            n.FileAttributes &= ~FILE_ATTRIBUTE_REPARSE_POINT;
+            return NtStatus.Success;
+        }
+    }
+
     public ValueTask<CreateResult> CreateFile(string fileName, uint createOptions, uint grantedAccess,
         uint fileAttributes, byte[]? sd, ulong allocationSize, FileOperationInfo info, CancellationToken ct)
     {
@@ -391,6 +499,14 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
         {
             if (!_nodes.TryGetValue(fileName, out var node))
                 return new(NtStatus.ObjectNameNotFound);
+
+            // LOCKSTEP with RamFileSystem.Move: reject moving a node into its own subtree.
+            // The flat map cannot form a cycle, but this also catches the case-only
+            // variants ("\a" → "\A\inner\newa") that bypass the Win32 layer, and the
+            // differential pair must agree on rejection or Comparators throws.
+            if (newFileName.Length > fileName.Length &&
+                MemfsFileNameComparer.HasPrefix(newFileName, fileName, true))
+                return new(NtStatus.ObjectNameInvalid);
 
             _nodes.TryGetValue(newFileName, out var newNode);
             if (newNode != null && !ReferenceEquals(node, newNode))

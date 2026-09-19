@@ -101,13 +101,47 @@ public sealed class WinFspRamAdapterSecurityTests : IDisposable
     }
 
     [Fact]
-    public void GetFileSecurityByName_NonexistentPath_ReturnsNotFound()
+    public void GetFileSecurityByName_MissingLeafUnderExistingDir_ReturnsNameNotFound()
+    {
+        _fs.CreateDirectory(@"\does").Should().NotBeNull();
+
+        byte[]? sd = null;
+        int status = _adapter.GetFileSecurityByName(@"\does\notexist", out uint attr, ref sd);
+
+        // The parent exists, so this is a missing NAME (not a missing PATH).
+        status.Should().Be(NtStatus.ObjectNameNotFound);
+        attr.Should().Be(0u);
+    }
+
+    [Fact]
+    public void GetFileSecurityByName_MissingAncestor_ReturnsPathNotFound()
     {
         byte[]? sd = null;
         int status = _adapter.GetFileSecurityByName(@"\does\not\exist", out uint attr, ref sd);
 
-        status.Should().Be(NtStatus.ObjectNameNotFound);
+        // No ancestor exists — NTFS and the reference implementation report PATH_NOT_FOUND,
+        // which callers treat differently from a missing leaf (e.g. CreateFile only treats
+        // NAME_NOT_FOUND as "safe to create").
+        status.Should().Be(NtStatus.ObjectPathNotFound);
         attr.Should().Be(0u);
+    }
+
+    [Fact]
+    public void GetFileSecurityByName_ParentIsAFile_ReturnsNotADirectory()
+    {
+        _fs.CreateFile(@"\plain.txt").Should().NotBeNull();
+
+        byte[]? sd = null;
+        int status = _adapter.GetFileSecurityByName(@"\plain.txt\child", out _, ref sd);
+
+        // Known, MEASURED divergence from NTFS: for "parent is a file" NTFS returns
+        // ERROR_PATH_NOT_FOUND, while this returns ERROR_DIRECTORY (STATUS_NOT_A_DIRECTORY).
+        // Upstream tst/memfs behaves the same way, and staying in lockstep with the
+        // reference implementation matters more here than matching NTFS on an edge case
+        // that only arises when a caller treats a file as a directory. WinFsp itself emits
+        // STATUS_NOT_A_DIRECTORY from its own driver, so the status is legitimate.
+        // (Verified on a real NTFS volume via both GetFileAttributesEx and CreateFile.)
+        status.Should().Be(NtStatus.NotADirectory);
     }
 
     // Minimal ILogger<T> capturing Warning-level messages for assertion.

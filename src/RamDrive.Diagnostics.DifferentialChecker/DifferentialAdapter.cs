@@ -56,12 +56,6 @@ public sealed class DifferentialAdapter : IFileSystem
     private static void SwapTo(FileOperationInfo info, object? ctx)
         => info.Context = ctx;
 
-    private static void SaveAndRestore(FileOperationInfo info, Pair pair, ref object? slot)
-    {
-        slot = info.Context;
-        info.Context = pair;
-    }
-
     public bool SynchronousIo => _ram.SynchronousIo;
 
     public int Init(FileSystemHost host)
@@ -152,9 +146,20 @@ public sealed class DifferentialAdapter : IFileSystem
         var b = await _reference.OverwriteFile(fileAttributes, replaceFileAttributes, allocationSize, info, ct);
         pair.RefCtx = info.Context;
         info.Context = pair;
+        // Same accepted capacity-model divergence as SetFileSize (OverwriteFile routes
+        // through the same SetFileSizeInternal in memfs): DISK_FULL vs SUCCESS only.
+        if (IsCapacityModelDivergence(a.Status, b.Status)) return a;
         Comparators.CompareFsResult("OverwriteFile", null, a, b);
         return a;
     }
+
+    /// <summary>
+    /// True when the only difference is the volume-capacity model (see SetFileSize).
+    /// Deliberately narrow: exactly DISK_FULL on one side and SUCCESS on the other.
+    /// </summary>
+    private static bool IsCapacityModelDivergence(int a, int b) =>
+        (a == NtStatus.DiskFull && b == NtStatus.Success) ||
+        (a == NtStatus.Success && b == NtStatus.DiskFull);
 
     public async ValueTask<ReadResult> ReadFile(string fileName, Memory<byte> buffer, ulong offset,
         FileOperationInfo info, CancellationToken ct)
@@ -258,6 +263,20 @@ public sealed class DifferentialAdapter : IFileSystem
         var b = await _reference.SetFileSize(fileName, newSize, setAllocationSize, info, ct);
         pair.RefCtx = info.Context;
         info.Context = pair;
+
+        // KNOWN, DELIBERATE DIVERGENCE — capacity accounting only.
+        //
+        // The two sides model volume capacity differently, by design:
+        //   * RamDrive's PagePool has a single committed-capacity gate: SetLength RESERVES
+        //     the pages it promises, so a concurrent reservation that would exceed the
+        //     volume fails with STATUS_DISK_FULL up front (and a later write cannot fail).
+        //   * tst/memfs (which MemfsReferenceFs is a 1:1 port of) only bounds the SINGLE
+        //     file at MaxFileSize and never accounts across files, so it returns SUCCESS.
+        // RamDrive is the one matching real NTFS behaviour here, so the divergence is
+        // accepted. Only the DISK_FULL-vs-SUCCESS pair is exempted: any other status
+        // mismatch, and every other SetFileSize result difference, is still reported.
+        if (IsCapacityModelDivergence(a.Status, b.Status)) return a;
+
         Comparators.CompareFsResult("SetFileSize", fileName, a, b);
         return a;
     }
@@ -374,6 +393,21 @@ public sealed class DifferentialAdapter : IFileSystem
         pair.RefCtx = info.Context;
         info.Context = pair;
         Comparators.CompareStatus("GetReparsePoint", fileName, sa, sb);
+        if (sa >= 0) Comparators.CompareReparseData("GetReparsePoint", fileName, rdA, rdB);
+        reparseData = rdA;
+        return sa;
+    }
+
+    // Name-based reparse probe for path resolution. No open handle / FileOperationInfo
+    // exists at this stage (the host invokes this from GetSecurityByName / slot 19), so
+    // dispatch straight to both children without the Context swap dance.
+    public int GetReparsePointByName(string fileName, bool isDirectory, ref byte[]? reparseData)
+    {
+        byte[]? rdA = reparseData, rdB = reparseData;
+        int sa = _ram.GetReparsePointByName(fileName, isDirectory, ref rdA);
+        int sb = _reference.GetReparsePointByName(fileName, isDirectory, ref rdB);
+        Comparators.CompareStatus("GetReparsePointByName", fileName, sa, sb);
+        if (sa >= 0) Comparators.CompareReparseData("GetReparsePointByName", fileName, rdA, rdB);
         reparseData = rdA;
         return sa;
     }
@@ -478,9 +512,18 @@ public sealed class DifferentialAdapter : IFileSystem
     public int ExceptionHandler(Exception ex)
     {
         // Surface DifferentialMismatchException to stderr (kernel callback would otherwise
-        // just see STATUS_UNEXPECTED_IO_ERROR and the user has no clue what diverged).
+        // just see STATUS_UNEXPECTED_IO_ERROR and the user has no clue what diverged)...
         Console.Error.WriteLine($"[DifferentialAdapter] {ex.GetType().Name}: {ex.Message}");
         if (ex is DifferentialMismatchException) Console.Error.Flush();
+
+        // ...AND record it. Returning _ram.ExceptionHandler(ex) below lets the operation
+        // complete with an error status, which a test can easily overlook: the test would
+        // pass while the two file systems disagreed. Recording makes the divergence
+        // assertable (DifferentialMismatchException.AssertNone) so a broken feature cannot
+        // keep the differential CI leg green.
+        if (ex is DifferentialMismatchException)
+            DifferentialMismatchException.Record(ex.Message);
+
         return _ram.ExceptionHandler(ex);
     }
 }

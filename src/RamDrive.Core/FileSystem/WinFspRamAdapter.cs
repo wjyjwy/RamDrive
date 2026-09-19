@@ -76,12 +76,27 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         _options = options.Value;
         _logger = logger;
 
-        // Set root directory security descriptor so WinFsp enforces ACLs
+        // Set root directory security descriptor so WinFsp enforces ACLs — but ONLY when
+        // the root does not already have one. On a fresh mount the tree is brand-new
+        // (root SD is null) so we install the default; on a fast reload the adapter is
+        // rebuilt around an EXISTING filesystem and the (possibly user-modified) root SD
+        // must be preserved.
+        if (fs.RootSecurityDescriptor == null)
+        {
+            var sd = new RawSecurityDescriptor(RootSddl);
+            var bytes = new byte[sd.BinaryLength];
+            sd.GetBinaryForm(bytes, 0);
+            _fs.SetRootSecurityDescriptor(bytes);
+        }
+        _rootSecurityDescriptorBytes = RootSecurityDescriptorBytes();
+    }
+
+    private byte[] RootSecurityDescriptorBytes()
+    {
         var sd = new RawSecurityDescriptor(RootSddl);
         var bytes = new byte[sd.BinaryLength];
         sd.GetBinaryForm(bytes, 0);
-        _fs.SetRootSecurityDescriptor(bytes);
-        _rootSecurityDescriptorBytes = bytes;
+        return bytes;
     }
 
     // ═══════════════════════════════════════════
@@ -106,6 +121,15 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         host.UnicodeOnDisk = true;
         host.PersistentAcls = true;
         host.PostCleanupWhenModifiedOnly = true;
+        // Reparse points (symbolic links / junctions) support. The WinFsp 2.x user-mode
+        // DLL performs link NAME RESOLUTION itself via the GetReparsePointByName /
+        // ResolveReparsePoints path wired in our vendored FileSystemHost (upstream
+        // WinFsp.Native ships slot 19 unwired, so links could be created but never
+        // followed). AccessCheck=false matches tst/memfs: the DLL does not run a second
+        // ACL check against the reparse point itself (mklink privilege/Developer Mode is
+        // still enforced by the Windows I/O manager on the STATUS_REPARSE bounce).
+        host.ReparsePoints = true;
+        host.ReparsePointsAccessCheck = false;
         // Non-zero volume serial. std::filesystem::copy_file compares (VolumeSerialNumber, file id)
         // to detect "source and destination are the same file". A zero serial combined with a zero
         // file id makes EVERY pair of files look identical, so a same-volume copy_file throws
@@ -126,6 +150,9 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     public void Unmounted(FileSystemHost host)
     {
         _logger.LogInformation("Drive unmounted");
+        // Drop the host reference so any straggler Notify() after unmount no-ops
+        // instead of issuing a kernel IOCTL against a stopped dispatcher.
+        _host = null;
     }
 
     // ═══════════════════════════════════════════
@@ -150,14 +177,47 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node == null)
         {
             fileAttributes = 0;
-            FsTracer.Trace("GetFileSecurityByName-NF", fileName);
-            return NtStatus.ObjectNameNotFound;
+            // Distinguish "the leaf is missing but its directory exists" (NAME_NOT_FOUND)
+            // from "an ancestor is missing" (PATH_NOT_FOUND) and "the parent is a file"
+            // (NOT_A_DIRECTORY). NTFS reports these separately, and so does the reference
+            // implementation via its GetParentStatus. Callers depend on the distinction —
+            // CreateFile treats OBJECT_NAME_NOT_FOUND as "safe to create" but every other
+            // status as a hard failure — so collapsing all of them into NAME_NOT_FOUND made
+            // the two file systems disagree on every probe beneath an existing parent.
+            int status = ParentStatus(fileName);
+            FsTracer.Trace("GetFileSecurityByName-NF", fileName, $"status=0x{status:X8}");
+            return status;
         }
 
         fileAttributes = (uint)node.Attributes;
         securityDescriptor = node.SecurityDescriptor ?? FallbackSdFor(fileName);
         FsTracer.Trace("GetFileSecurityByName", fileName, $"attr=0x{fileAttributes:X}");
         return NtStatus.Success;
+    }
+
+    /// <summary>
+    /// Status for a path whose leaf does not exist, decided by its parent: PATH_NOT_FOUND
+    /// when the parent is absent, NOT_A_DIRECTORY when the parent is a file, otherwise
+    /// NAME_NOT_FOUND. Mirrors MemfsReferenceFs.GetParentStatus.
+    ///
+    /// <para>Measured against a real NTFS volume (via both GetFileAttributesEx and
+    /// CreateFile), the first two cases agree exactly. The third is a known divergence:
+    /// NTFS reports ERROR_PATH_NOT_FOUND for "parent is a file", while this (and upstream
+    /// tst/memfs, which this must stay in lockstep with) report ERROR_DIRECTORY.
+    /// STATUS_NOT_A_DIRECTORY is a legitimate status — WinFsp's own driver emits it from
+    /// src/sys/create.c — and it is the more precise answer. Pinned by
+    /// WinFspRamAdapterSecurityTests.GetFileSecurityByName_ParentIsAFile_ReturnsNotADirectory.</para>
+    /// </summary>
+    private int ParentStatus(string fileName)
+    {
+        if (fileName.Length <= 1) return NtStatus.ObjectNameNotFound;
+        int i = fileName.LastIndexOf('\\');
+        if (i <= 0) return NtStatus.ObjectNameNotFound;
+
+        var parent = _fs.FindNode(fileName[..i]);
+        if (parent == null) return NtStatus.ObjectPathNotFound;
+        if (!parent.IsDirectory) return NtStatus.NotADirectory;
+        return NtStatus.ObjectNameNotFound;
     }
 
     // Defensive fallback for GetFileSecurityByName / GetFileSecurity. Should be unreachable
@@ -186,6 +246,15 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     // binding (winfsp src/dotnet/FileSystemBase+Const.cs:319): STATUS_INVALID_OWNER = 0xC000005A,
     // which WinFsp maps to Win32 ERROR_INVALID_OWNER (1307).
     private const int STATUS_INVALID_OWNER = unchecked((int)0xC000005A);
+
+    // STATUS_INVALID_SECURITY_DESCR = 0xC000005D (no NtStatus constant available).
+    // NOTE: 0xC0000058 is STATUS_UNKNOWN_REVISION, NOT this status — the two are easy to
+    // confuse because 0x58 reads like "SD". The correct value per the Windows SDK
+    // ntstatus.h is 0x5D; WinFsp maps it to Win32 ERROR_INVALID_SECURITY_DESCR (1338).
+    private const int STATUS_INVALID_SECURITY_DESCR = unchecked((int)0xC000005D);
+
+    // Conservative failure for unhandled callback exceptions (STATUS_UNSUCCESSFUL).
+    private const int STATUS_UNSUCCESSFUL = unchecked((int)0xC0000001);
 
     /// <summary>
     /// Approximate NTFS owner-assignment privilege enforcement. WinFsp does not surface the caller
@@ -231,8 +300,13 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             var dir = _fs.CreateDirectory(fileName, securityDescriptor);
             if (dir == null)
             {
-                FsTracer.Trace("CreateFile-Dir-Coll", fileName);
-                return V(CreateResult.Error(NtStatus.ObjectNameCollision));
+                if (_fs.FindNode(fileName) != null)
+                {
+                    FsTracer.Trace("CreateFile-Dir-Coll", fileName);
+                    return V(CreateResult.Error(NtStatus.ObjectNameCollision));
+                }
+                FsTracer.Trace("CreateFile-Dir-PathNF", fileName);
+                return V(CreateResult.Error(NtStatus.ObjectPathNotFound));
             }
 
             info.Context = dir;
@@ -298,13 +372,18 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node?.Content == null)
             return V(FsResult.Error(NtStatus.ObjectNameNotFound));
 
+        // P0-2: check capacity BEFORE truncating. The old order (SetLength(0) first)
+        // silently destroyed the original file when the hinted allocation didn't fit:
+        // the caller saw DISK_FULL and assumed the overwrite never happened, but the
+        // data was already gone.
+        if (allocationSize > 0 && (long)allocationSize > _fs.FreeBytes)
+        {
+            FsTracer.Trace("OverwriteFile-DiskFull", info.FileName ?? "", $"alloc={allocationSize}");
+            return V(FsResult.Error(NtStatus.DiskFull));
+        }
+
         long sizeBefore = node.Content.Length;
         node.Content.SetLength(0);
-
-        // Early capacity check: if the caller hints at the final file size,
-        // fail fast before the copy begins rather than mid-write.
-        if (allocationSize > 0 && (long)allocationSize > _fs.FreeBytes)
-            return V(FsResult.Error(NtStatus.DiskFull));
 
         if (replaceFileAttributes && fileAttributes != 0)
             node.Attributes = (FileAttributes)fileAttributes;
@@ -424,8 +503,12 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node == null)
             return V(FsResult.Error(NtStatus.ObjectNameNotFound));
 
-        // unchecked((uint)-1) means "don't change"
-        if (fileAttributes != unchecked((uint)(-1)) && fileAttributes != 0)
+        // unchecked((uint)-1) means "don't change"; 0 means "clear all attributes" and MUST be
+        // applied. LOCKSTEP: MemfsReferenceFs.SetFileAttributes applies 0 as well
+        // (`if (fileAttributes != unchecked((uint)-1)) n.FileAttributes = fileAttributes;`),
+        // and DifferentialAdapter / Comparators.CompareStatus throw on any divergence — the
+        // old `&& fileAttributes != 0` here was an undetected semantic drift.
+        if (fileAttributes != unchecked((uint)(-1)))
             node.Attributes = (FileAttributes)fileAttributes;
 
         if (creationTime != 0) node.CreationTime = DateTime.FromFileTimeUtc((long)creationTime);
@@ -454,6 +537,20 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             long additional = (long)newSize - node.Size;
             if (additional > 0 && additional > _fs.FreeBytes)
                 return V(FsResult.Error(NtStatus.DiskFull));
+
+            // P1-2: shrinking the allocation size must also shrink the logical size —
+            // NTFS and MemfsReferenceFs.SetFileSizeInternal both do
+            // `if (FileSize > newSize) FileSize = newSize`. Keeping FileSize unchanged
+            // diverges from the differential oracle and leaves cached applications with
+            // stale (too large) sizes.
+            if ((long)newSize < node.Content.Length)
+            {
+                if (!node.Content.SetLength((long)newSize))
+                    return V(FsResult.Error(NtStatus.DiskFull));
+                node.LastWriteTime = DateTime.UtcNow;
+                Notify(FileNotify.ChangeSize | FileNotify.ChangeLastWrite, FileNotify.ActionModified, fileName);
+            }
+
             FsTracer.Trace("SetFileSize-Alloc", fileName, $"newSize={newSize} curSize={node.Size}");
             return V(FsResult.Success(MakeFileInfo(node)));
         }
@@ -492,7 +589,20 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         // the no-null-SD structural invariant means this should be unreachable). Threading the same
         // bytes into both the owner-change guard and the merge keeps them consistent.
         byte[] currentSd = node.SecurityDescriptor ?? _rootSecurityDescriptorBytes;
-        var modification = new RawSecurityDescriptor(modificationDescriptor, 0);
+
+        // P1-4: a malformed / maliciously constructed descriptor must be rejected, not thrown
+        // into the WinFsp dispatcher (an unhandled exception there surfaces to every open handle).
+        RawSecurityDescriptor modification;
+        try
+        {
+            modification = new RawSecurityDescriptor(modificationDescriptor, 0);
+        }
+        catch (Exception ex) when (ex is ArgumentException or FormatException)
+        {
+            FsTracer.Trace("SetFileSecurity-BadSd", fileName, $"len={modificationDescriptor.Length}");
+            _logger.LogDebug(ex, "Malformed security descriptor rejected for {Path}", fileName);
+            return STATUS_INVALID_SECURITY_DESCR;
+        }
 
         // NTFS oracle: a non-privileged caller cannot reassign the owner. WinFsp does not pass the
         // caller token here, so we approximate by rejecting any owner *change*. The failure is
@@ -521,6 +631,126 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     }
 
     // ═══════════════════════════════════════════
+    //  Reparse points (symlinks / junctions)
+    // ═══════════════════════════════════════════
+
+    /// <summary>
+    /// Name-based reparse lookup used by WinFsp 2.x user-mode name resolution
+    /// (FindReparsePoint during GetSecurityByName suffix probes and
+    /// ResolveReparsePoints during Create/Open traversal). No open handle exists at
+    /// this point, so resolve strictly by path under the structure lock.
+    /// LOCKSTEP semantics with <c>MemfsReferenceFs.GetReparsePointByName</c>.
+    /// </summary>
+    public int GetReparsePointByName(string fileName, bool isDirectory, ref byte[]? reparseData)
+    {
+        var node = _fs.FindNode(fileName);
+        if (node == null)
+        {
+            FsTracer.Trace("GetReparseByName-NF", fileName);
+            return NtStatus.ObjectNameNotFound;
+        }
+        if (node.ReparseData == null)
+            return NtStatus.NotAReparse;
+
+        reparseData = node.ReparseData;
+        FsTracer.Trace("GetReparseByName", fileName, $"tag=0x{node.ReparseTag:X8} len={node.ReparseData.Length}");
+        return NtStatus.Success;
+    }
+
+    /// <summary>FSCTL_GET_REPARSE_POINT on an open handle.</summary>
+    public int GetReparsePoint(string fileName, ref byte[]? reparseData, FileOperationInfo info)
+    {
+        var node = Node(info);
+        if (node == null)
+            return NtStatus.ObjectNameNotFound;
+        if (node.ReparseData == null)
+        {
+            FsTracer.Trace("GetReparse-NotReparse", fileName);
+            return NtStatus.NotAReparse;
+        }
+
+        reparseData = node.ReparseData;
+        FsTracer.Trace("GetReparse", fileName, $"tag=0x{node.ReparseTag:X8} len={node.ReparseData.Length}");
+        return NtStatus.Success;
+    }
+
+    /// <summary>
+    /// FSCTL_SET_REPARSE_POINT: turn an open file/empty-directory node into a reparse
+    /// point. Rules mirror tst/memfs SetReparsePoint 1:1 (differential parity):
+    /// a directory that still contains children is rejected with DIRECTORY_NOT_EMPTY,
+    /// and replacing an existing point must use the same tag (and GUID for non-MS tags).
+    /// </summary>
+    public int SetReparsePoint(string fileName, byte[] reparseData, FileOperationInfo info)
+    {
+        var node = Node(info);
+        if (node == null)
+            return NtStatus.ObjectNameNotFound;
+        if (reparseData.Length < ReparsePointBuffer.MinimumSize)
+            return NtStatus.IoReparseDataInvalid;
+
+        if (node.IsDirectory && node.Children!.Count > 0)
+        {
+            FsTracer.Trace("SetReparse-NotEmpty", fileName);
+            return NtStatus.DirectoryNotEmpty;
+        }
+
+        if (node.ReparseData != null)
+        {
+            int replace = ReparsePointBuffer.CanReplace(
+                node.ReparseData, node.ReparseData.Length, reparseData, reparseData.Length);
+            if (replace != NtStatus.Success)
+            {
+                FsTracer.Trace("SetReparse-Reject", fileName, $"status=0x{replace:X8}");
+                return replace;
+            }
+        }
+
+        // Own copy: the incoming buffer is a transient native marshalling array and the
+        // node must keep a stable snapshot for concurrent traversal probes.
+        node.ReparseData = (byte[])reparseData.Clone();
+        node.ReparseTag = ReparsePointBuffer.GetTag(reparseData);
+        node.Attributes |= FileAttributes.ReparsePoint;
+
+        FsTracer.Trace("SetReparse", fileName, $"tag=0x{node.ReparseTag:X8} len={reparseData.Length}");
+        // Attributes/metadata changed — keep the kernel FileInfo cache coherent.
+        Notify(FileNotify.ChangeAttributes | FileNotify.ChangeLastWrite, FileNotify.ActionModified, fileName);
+        return NtStatus.Success;
+    }
+
+    /// <summary>
+    /// FSCTL_DELETE_REPARSE_POINT: strip the reparse attribute/data. The client must
+    /// present a buffer matching the existing point (same tag/GUID) — same
+    /// FspFileSystemCanReplaceReparsePoint gate memfs applies.
+    /// </summary>
+    public int DeleteReparsePoint(string fileName, byte[] reparseData, FileOperationInfo info)
+    {
+        var node = Node(info);
+        if (node == null)
+            return NtStatus.ObjectNameNotFound;
+        if (node.ReparseData == null)
+        {
+            FsTracer.Trace("DeleteReparse-NotReparse", fileName);
+            return NtStatus.NotAReparse;
+        }
+
+        int replace = ReparsePointBuffer.CanReplace(
+            node.ReparseData, node.ReparseData.Length, reparseData, reparseData.Length);
+        if (replace != NtStatus.Success)
+        {
+            FsTracer.Trace("DeleteReparse-Reject", fileName, $"status=0x{replace:X8}");
+            return replace;
+        }
+
+        node.ReparseData = null;
+        node.ReparseTag = 0;
+        node.Attributes &= ~FileAttributes.ReparsePoint;
+
+        FsTracer.Trace("DeleteReparse", fileName);
+        Notify(FileNotify.ChangeAttributes | FileNotify.ChangeLastWrite, FileNotify.ActionModified, fileName);
+        return NtStatus.Success;
+    }
+
+    // ═══════════════════════════════════════════
     //  Delete / Move
     // ═══════════════════════════════════════════
 
@@ -544,7 +774,8 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         string fileName, string newFileName, bool replaceIfExists,
         FileOperationInfo info, CancellationToken ct)
     {
-        if (_fs.Move(fileName, newFileName, replaceIfExists))
+        int status = _fs.Move(fileName, newFileName, replaceIfExists);
+        if (status == NtStatus.Success)
         {
             // Update cached node — name changed
             var node = Node(info);
@@ -558,8 +789,11 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             Notify(FileNotify.ChangeFileName, FileNotify.ActionRenamedNewName, newFileName);
             return V(NtStatus.Success);
         }
-        FsTracer.Trace("MoveFile-Coll", fileName, $"=> {newFileName}");
-        return V(NtStatus.ObjectNameCollision);
+        // Propagate the specific NTSTATUS (COLLISION vs ACCESS_DENIED vs NOT_FOUND) so the
+        // Win32 error an application sees matches NTFS. Collapsing everything to
+        // ObjectNameCollision hid "destination is a directory" from callers.
+        FsTracer.Trace("MoveFile-Fail", fileName, $"=> {newFileName} status=0x{status:X8}");
+        return V(status);
     }
 
     // ═══════════════════════════════════════════
@@ -572,10 +806,21 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         {
             // Capture IsDirectory BEFORE Delete disposes the node.
             bool wasDir = info.IsDirectory;
-            _fs.Delete(fileName);
-            FsTracer.Trace("Cleanup-Delete", fileName, $"isDir={wasDir} flags=0x{(uint)flags:X}");
-            Notify(wasDir ? FileNotify.ChangeDirName : FileNotify.ChangeFileName,
-                FileNotify.ActionRemoved, fileName);
+            // P1-5: only broadcast ActionRemoved when the deletion actually happened.
+            // Sending it unconditionally lets a failed delete (e.g. a child created
+            // between CanDelete and here) leave the kernel cache believing the file
+            // is gone while it still exists — the inverse of the staleness matrix
+            // this notification system exists to prevent.
+            if (_fs.Delete(fileName))
+            {
+                FsTracer.Trace("Cleanup-Delete", fileName, $"isDir={wasDir} flags=0x{(uint)flags:X}");
+                Notify(wasDir ? FileNotify.ChangeDirName : FileNotify.ChangeFileName,
+                    FileNotify.ActionRemoved, fileName);
+            }
+            else
+            {
+                FsTracer.Trace("Cleanup-Delete-Fail", fileName, "delete returned false");
+            }
         }
         else if (fileName != null)
         {
@@ -650,6 +895,12 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         return V(ReadDirectoryResult.Success(bytesTransferred));
     }
 
+    public int ExceptionHandler(Exception ex)
+    {
+        _logger.LogError(ex, "Unhandled exception in WinFsp callback");
+        return STATUS_UNSUCCESSFUL;
+    }
+
     // ═══════════════════════════════════════════
     //  Helpers
     // ═══════════════════════════════════════════
@@ -694,6 +945,11 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     private static FspFileInfo MakeFileInfo(FileNode node) => new()
     {
         FileAttributes = (uint)node.Attributes,
+        // 0 for plain nodes; IO_REPARSE_TAG_SYMLINK / IO_REPARSE_TAG_MOUNT_POINT / etc. for links.
+        // The WinFsp access-check path learns reparse points via GetFileSecurityByName's
+        // FILE_ATTRIBUTE_REPARSE_POINT attribute; this tag is reported in Create/Open/Query
+        // responses and directory enumerations (FileAttributeTagInfo gets it here).
+        ReparseTag = node.ReparseTag,
         FileSize = (ulong)node.Size,
         AllocationSize = (ulong)node.AllocatedBytes, // actual pages, not logical size
         CreationTime = ToFileTime(node.CreationTime),
