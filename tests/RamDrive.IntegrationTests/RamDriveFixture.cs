@@ -33,6 +33,15 @@ public sealed class RamDriveFixture : IDisposable
 
     public RamDriveFixture()
     {
+        // Differential mode (RAMDRIVE_DIFF=1) wraps the production adapter in
+        // DifferentialAdapter, which runs every mutation twice and compares the two.
+        // That is a SEMANTIC comparison — notification IOCTLs only add latency and
+        // thread-pool pressure to it. Measured on GitHub CI: with notifications on, the
+        // differential leg failed in 45s with ~46k divergences instead of passing after
+        // ~1020s, and the ordinary test leg slowed from 84s to 358s. So the differential
+        // leg runs with notifications off; the ordinary leg keeps them on.
+        bool differential = Environment.GetEnvironmentVariable("RAMDRIVE_DIFF") == "1";
+
         var options = new RamDriveOptions
         {
             CapacityMb = CapacityMb,
@@ -42,6 +51,13 @@ public sealed class RamDriveFixture : IDisposable
             // calls produce stale-cache test failures in CI rather than only against
             // real Chromium with the production default. See specs/cache-invalidation.
             FileInfoTimeoutMs = uint.MaxValue,
+            // ...and turn the notification matrix ON. With EnableNotifications=false the
+            // Notify() call early-returns, so the "worst-case timeout" above would catch
+            // nothing: a missing Notify would be indistinguishable from a correct one.
+            // The whole point of pinning uint.MaxValue is to make notifications the sole
+            // coherence mechanism, so this fixture must enable them — except in
+            // differential mode (see above).
+            EnableNotifications = !differential,
             VolumeLabel = "IntegrationTest",
         };
 
@@ -80,6 +96,21 @@ public sealed class RamDriveFixture : IDisposable
 
     public void Dispose()
     {
+        // In differential mode a divergence is RECORDED rather than thrown (it cannot
+        // propagate through a kernel callback), so without this check a behavioural drift
+        // between the production adapter and the reference file system could still show up
+        // as a green test.
+        //
+        // Scope: only the single-threaded tests are meaningful here. The adapter calls the
+        // two file systems sequentially, so under a concurrency stress test (TortureTests,
+        // ChaosTests, ConcurrencyCorruptionTests) another thread can mutate the file
+        // between the two calls and the comparison then reports a harness artefact instead
+        // of a real difference. Those tests are excluded from the differential leg in CI
+        // for the same reason — see the `--filter` in ci.yml.
+        if (Environment.GetEnvironmentVariable("RAMDRIVE_DIFF") == "1")
+            RamDrive.Diagnostics.DifferentialChecker.DifferentialMismatchException.AssertNone(
+                "DifferentialAdapter diverged from MemfsReferenceFs");
+
         _host.Dispose();
         _fs.Dispose();
         _pool.Dispose();

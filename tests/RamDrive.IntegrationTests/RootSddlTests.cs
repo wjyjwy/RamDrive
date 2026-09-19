@@ -52,13 +52,14 @@ public class RootSddlTests
     {
         var sd = new RawSecurityDescriptor(CanonicalRootSddl);
         var dacl = sd.DiscretionaryAcl;
+        dacl.Should().NotBeNull("the canonical root SDDL must include a DACL");
 
         // We expect three Allow ACEs: SYSTEM (SY), Administrators (BA), Everyone (WD).
         var sids = new System.Collections.Generic.List<string>();
-        for (int i = 0; i < dacl.Count; i++)
+        for (int i = 0; i < dacl!.Count; i++)
         {
             if (dacl[i] is CommonAce ace && ace.AceType == AceType.AccessAllowed)
-                sids.Add(ace.SecurityIdentifier.Value);
+                sids.Add(ace.SecurityIdentifier?.Value ?? "");
         }
         sids.Should().Contain("S-1-5-18", "LocalSystem (SY) must be granted access");
         sids.Should().Contain("S-1-5-32-544", "BUILTIN\\Administrators (BA) must be granted access");

@@ -52,12 +52,17 @@ public sealed class InitialDirectoriesSdFixture : IDisposable
 
     public InitialDirectoriesSdFixture()
     {
+        // See RamDriveFixture: the differential leg runs without notifications so the
+        // comparison stays a pure semantic one.
+        bool differential = Environment.GetEnvironmentVariable("RAMDRIVE_DIFF") == "1";
+
         var options = new RamDriveOptions
         {
             CapacityMb = 64,
             PageSizeKb = 64,
             EnableKernelCache = true,
             FileInfoTimeoutMs = uint.MaxValue,
+            EnableNotifications = !differential,
             VolumeLabel = "InitDirTest",
         };
 
