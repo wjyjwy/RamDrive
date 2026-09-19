@@ -1,10 +1,16 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # 完全手动控制：只允许 workflow_dispatch（Actions 页面点 "Run workflow"，
+  # 或由维护者/自动化通过 API 对指定分支触发，可指定分支）。
+  #
+  # 意图：该仓库（fork）的云端环境会在文件变更后自动提交并 push 自己的工作分支，
+  # 因此任何「自动事件」都可能被环境自身的 push 误触发。为保证「不让我触发就绝不
+  # 运行」：
+  #   - 移除 push:[main]（main 自身 push 不触发，main 代码不跑测试）
+  #   - 移除 pull_request（PR 分支的更新也不自动触发）
+  # 需要验证时，点 "Run workflow" 并在分支下拉框里选择要测的分支即可。
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -86,17 +92,27 @@ jobs:
           if ($failed) { exit 1 }
 
       - name: Test (DifferentialChecker)
+        # !cancelled() rather than the implicit success(): a failure in the plain suite
+        # above must not mask the differential verdict. The two answer different
+        # questions (does it work / does it still match memfs), so both should report.
+        if: ${{ !cancelled() }}
         shell: pwsh
         env:
           RAMDRIVE_DIFF: "1"
         run: |
           # Re-run integration tests with the production WinFspRamAdapter wrapped in
           # DifferentialAdapter against MemfsReferenceFs. Throws on the first
-          # behavioural divergence between the two file systems. Excludes ChaosTests
-          # (long random-fuzz; CI smoke covers the structured cases).
+          # behavioural divergence between the two file systems.
+          #
+          # Excluded: the concurrency stress suites (ChaosTests, TortureTests,
+          # ConcurrencyCorruptionTests). The differential adapter calls the two file
+          # systems SEQUENTIALLY, so under concurrent writers another thread can mutate the
+          # file between the two calls and the comparison reports a harness artefact rather
+          # than a real behavioural difference. Those suites still run in full in the plain
+          # leg above; only their cross-implementation comparison is meaningless.
           dotnet test tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj `
             -c Release --no-build --verbosity normal `
-            --filter "FullyQualifiedName!~ChaosTests" `
+            --filter "FullyQualifiedName!~ChaosTests&FullyQualifiedName!~TortureTests&FullyQualifiedName!~ConcurrencyCorruptionTests" `
             --logger "trx;LogFileName=RamDrive.IntegrationTests.Diff.trx" `
             --results-directory ./TestResults
           if ($LASTEXITCODE -ne 0) { exit 1 }

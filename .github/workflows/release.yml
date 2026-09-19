@@ -58,8 +58,13 @@ jobs:
       - name: Test
         shell: pwsh
         run: |
+          # Same coverage as CI (Core + Integration): a release is the most important
+          # artifact, so it must not be LESS tested than a branch build. The Core suite is
+          # fast; the Integration suite mounts a real WinFsp volume (the release
+          # binaries are built from the exact code being signed and published).
           $projects = @(
-            "tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj"
+            "tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj",
+            "tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj"
           )
           $failed = $false
           foreach ($proj in $projects) {
