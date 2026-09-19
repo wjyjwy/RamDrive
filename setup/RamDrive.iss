@@ -1,5 +1,5 @@
 ﻿; RamDrive Inno Setup Script
-; Bundles RamDrive AOT exe + WinFsp installer
+; Bundles RamDrive + WinFsp installer
 ; Supports both portable (green) and Windows Service modes
 ;
 ; Architecture switching:
@@ -8,12 +8,28 @@
 ;                                                       ; → RamDrive-X.Y.Z-x64-setup.exe
 ;     ISCC.exe /DMyAppArch=arm64 setup\RamDrive.iss     ; ARM64 installer
 ;                                                       ; → RamDrive-X.Y.Z-arm64-setup.exe
-;   The ARM64 leg expects publish output in ..\publish-aot-arm64; the x64 leg
-;   uses ..\publish-aot. WinFsp's MSI is architecture-universal — the same
-;   .msi is bundled regardless of MyAppArch.
+;   WinFsp's MSI is architecture-universal — the same .msi is bundled regardless
+;   of MyAppArch.
+;
+; Deployment kind switching:
+;   aot       (default) — Native AOT: self-contained single RamDrive.exe published
+;                         to ..\publish-aot[-arm64]. Runs on a machine with nothing
+;                         installed but WinFsp.
+;     publish: dotnet publish src/RamDrive.Cli/RamDrive.Cli.csproj -c Release \
+;                -r win-x64 -o ./publish-aot
+;
+;   framework           — framework-dependent: the whole ..\publish-fx[-arm64]
+;                         folder (RamDrive.exe apphost + DLLs + deps.json), which
+;                         requires the .NET 10 runtime on the target machine. The
+;                         installer refuses to start when it is missing.
+;     publish: dotnet publish src/RamDrive.Cli/RamDrive.Cli.csproj -c Release \
+;                -r win-x64 -p:PublishAot=false --self-contained false -o ./publish-fx
+;
+;     ISCC.exe /DDeployKind=framework setup\RamDrive.iss
+;       → RamDrive-X.Y.Z-x64-fx-setup.exe   (suffix -fx keeps the two apart)
 
 #define MyAppName      "RamDrive"
-#define MyAppVersion   "0.0.0-dev"
+#define MyAppVersion   "1.0.0-dev"
 #define MyAppPublisher "HYProjects"
 #define MyAppExeName   "RamDrive.exe"
 #define MyAppURL       "https://github.com/hooyao/RamDrive"
@@ -22,20 +38,41 @@
   #define MyAppArch    "x64"
 #endif
 
+#ifndef DeployKind
+  #define DeployKind   "aot"
+#endif
+
 #if MyAppArch == "arm64"
-  #define PublishDir       "..\publish-aot-arm64"
   #define ArchSuffix       "-arm64"
   #define ArchAllowed      "arm64"
   #define ArchInstall64    "arm64"
   #define WinFspDll        "winfsp-a64.dll"
 #elif MyAppArch == "x64"
-  #define PublishDir       "..\publish-aot"
   #define ArchSuffix       "-x64"
   #define ArchAllowed      "x64compatible"
   #define ArchInstall64    "x64compatible"
   #define WinFspDll        "winfsp-x64.dll"
 #else
   #error Unsupported MyAppArch. Use "x64" or "arm64".
+#endif
+
+; Publish folder + output-name suffix depend on the deployment kind, not the arch.
+#if DeployKind == "aot"
+  #define DeploySuffix     ""
+  #if MyAppArch == "arm64"
+    #define PublishDir     "..\publish-aot-arm64"
+  #else
+    #define PublishDir     "..\publish-aot"
+  #endif
+#elif DeployKind == "framework"
+  #define DeploySuffix     "-fx"
+  #if MyAppArch == "arm64"
+    #define PublishDir     "..\publish-fx-arm64"
+  #else
+    #define PublishDir     "..\publish-fx"
+  #endif
+#else
+  #error Unsupported DeployKind. Use "aot" or "framework".
 #endif
 
 ; WinFsp MSI filename - place the .msi in the setup\ folder before compiling
@@ -57,7 +94,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\installer-output
-OutputBaseFilename=RamDrive-{#MyAppVersion}{#ArchSuffix}-setup
+OutputBaseFilename=RamDrive-{#MyAppVersion}{#ArchSuffix}{#DeploySuffix}-setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 PrivilegesRequired=admin
@@ -85,8 +122,19 @@ Name: "service"; Description: "Register as Windows Service (auto-start with Wind
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
 [Files]
-; RamDrive AOT binaries
+#if DeployKind == "framework"
+; Framework-dependent build: RamDrive.exe is only the apphost — the program itself,
+; the WinFsp binding and every Microsoft.Extensions.* dependency live in sibling DLLs,
+; so the WHOLE publish folder is installed. There is no .NET runtime in here: the
+; machine must have .NET 10 (checked in InitializeSetup). *.pdb is a build artefact;
+; appsettings.jsonc is staged to {tmp} below instead (the wizard patches it).
+Source: "{#PublishDir}\*"; DestDir: "{app}"; \
+  Flags: ignoreversion recursesubdirs createallsubdirs; \
+  Excludes: "*.pdb,appsettings.jsonc"; Components: main
+#else
+; RamDrive AOT binaries (self-contained single exe)
 Source: "{#PublishDir}\RamDrive.exe";      DestDir: "{app}"; Flags: ignoreversion; Components: main
+#endif
 ; appsettings.jsonc — copied to installer's temp first; WriteAppSettings then
 ; loads it, patches MountPoint/CapacityMb/InitialDirectories with the user's
 ; choices, and writes the result to {app} (preserving every other field and
@@ -696,6 +744,68 @@ begin
   Result := (ResultCode = 0);
 end;
 
+#if DeployKind == "framework"
+// ─── .NET 10 runtime presence ─────────────────────────────────────────────────
+// A framework-dependent package ships RamDrive.dll plus its dependencies but NOT
+// the runtime. Without Microsoft.NETCore.App 10.x the apphost aborts at launch —
+// on the service install type that means the install "succeeds", the service gets
+// registered, and the drive simply never appears. Detect it before touching
+// anything and refuse with an actionable message.
+
+function DirHasDotNet10(const SharedRoot: String): Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Result := False;
+  if not DirExists(SharedRoot) then Exit;
+  if not FindFirst(AddBackslash(SharedRoot) + '10.*', FindRec) then Exit;
+  try
+    repeat
+      if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+      begin
+        Result := True;
+        Exit;
+      end;
+    until not FindNext(FindRec);
+  finally
+    FindClose(FindRec);
+  end;
+end;
+
+// Every location a .NET runtime can live in: the default per-machine install
+// (Program Files), an x86 install (visible to a 32-bit setup), a per-user install
+// (%LOCALAPPDATA%\Microsoft\dotnet), and an explicit DOTNET_ROOT.
+function HasDotNet10Runtime: Boolean;
+var
+  Root: String;
+begin
+  Result :=
+    DirHasDotNet10(ExpandConstant('{pf}\dotnet\shared\Microsoft.NETCore.App')) or
+    DirHasDotNet10(ExpandConstant('{pf32}\dotnet\shared\Microsoft.NETCore.App')) or
+    DirHasDotNet10(ExpandConstant('{localappdata}\Microsoft\dotnet\shared\Microsoft.NETCore.App'));
+
+  if Result then Exit;
+
+  Root := GetEnv('DOTNET_ROOT');
+  if Root <> '' then
+    Result := DirHasDotNet10(AddBackslash(Root) + 'shared\Microsoft.NETCore.App');
+end;
+
+function CheckDotNet10Runtime: Boolean;
+begin
+  Result := HasDotNet10Runtime;
+  if Result then Exit;
+
+  MsgBox('This RamDrive package is framework-dependent: it needs the .NET 10 runtime, ' +
+         'which is not installed on this machine.' + #13#10 + #13#10 +
+         'Install the ".NET Runtime" (not the SDK) from:' + #13#10 +
+         'https://dotnet.microsoft.com/download/dotnet/10.0' + #13#10 + #13#10 +
+         'and run this installer again. Alternatively use the self-contained (AOT) ' +
+         'RamDrive installer, which bundles everything it needs.',
+         mbError, MB_OK);
+end;
+#endif
+
 function InitializeSetup: Boolean;
 var
   Choice: Integer;
@@ -704,6 +814,16 @@ var
   ResultCode: Integer;
 begin
   Result := True;
+
+#if DeployKind == "framework"
+  // Missing runtime is fatal for this package — refuse up front, before any
+  // system change (see CheckDotNet10Runtime).
+  if not CheckDotNet10Runtime then
+  begin
+    Result := False;
+    Exit;
+  end;
+#endif
 
   // Heads-up before we touch anything: WinFsp now installs *before* the RAM
   // disk is unmounted (see PrepareToInstall), but PrepareToInstall then stops
@@ -838,6 +958,17 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+
+  // Enable Mount Manager BEFORE WinFsp is installed/reinstalled. WinFsp's kernel
+  // driver (winfsp.sys) reads MountUseMountmgrFromFSD exactly once, at DriverEntry.
+  // Writing it here — before msiexec (re)registers and loads the driver — means the
+  // fresh driver already sees 1, so the very first service start mounts through the
+  // Mount Manager with no warning. Writing it only in ssPostInstall (after the driver
+  // is already loaded) is why a first run used to fall back to DefineDosDevice and
+  // "running RamDrive.exe once more" appeared to fix it: that second run only happened
+  // to follow a driver reload. Keep the ssPostInstall call as an idempotent backstop
+  // for the "WinFsp component not selected" path.
+  ConfigureWinFspMountManager;
 
   // Install WinFsp if selected and an equal-or-newer version isn't already
   // present. Done here (drive still mounted) — see note above.
