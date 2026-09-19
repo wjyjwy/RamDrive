@@ -2,8 +2,12 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 
-const exe = 'C:\\Users\\HuYao\\AppData\\Local\\ms-playwright\\chromium-1208\\chrome-win64\\chrome.exe';
-const userDataDir = process.argv[2] || 'Z:\\Temp\\rarbg_browser_72j1evkz';
+// Chromium path: set CHROME_EXE, or rely on Playwright's per-user bundle.
+const exe = process.env.CHROME_EXE
+  || (process.env.LOCALAPPDATA
+        ? `${process.env.LOCALAPPDATA}\\ms-playwright\\chromium-1208\\chrome-win64\\chrome.exe`
+        : 'chrome.exe');
+const userDataDir = process.argv[2] || 'R:\\Temp\\chrome-repro';
 
 const args = [
   '--disable-field-trial-config','--disable-background-networking','--disable-background-timer-throttling',

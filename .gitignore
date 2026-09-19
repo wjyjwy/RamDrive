@@ -192,13 +192,36 @@ FodyWeavers.xsd
 # RamDrive project-specific
 appsettings.dev.jsonc
 publish-aot/
+publish-aot-arm64/
+publish-fx/
+publish-fx-arm64/
 publish-test/
 installer-output/
 dokan-dotnet/
 .claude/
+
+# Uploads / scratch, and build-installer artifacts. These are large binaries that
+# change on every build — committing them would bloat the repo for no benefit.
+.uploads/
+*.zip
+*.7z
+*.rar
+*.gz
+*.tar
+*.bz2
+*.xz
+*.exe
+*.msi
+*.pdb
 
 # TLA+ model checker artifacts
 tla/states/
 tla/*.bin
 tla/*_TTrace_*.tla
 tla/tla2tools.jar
+
+# AI-assistant working directory: env wrapper, build/test logs, local publish output,
+# and session memory. Kept inside the workspace deliberately; excluded so it never
+# shows up in git status.
+.workbuddy/
+

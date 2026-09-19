@@ -16,9 +16,42 @@ dotnet test
 
 # AOT publish (requires Visual Studio C++ Build Tools + vswhere in PATH)
 dotnet publish src/RamDrive.Cli/RamDrive.Cli.csproj -c Release -r win-x64 -o ./publish-aot
+
+# Framework-dependent publish (no C++ toolchain; the target machine needs the .NET 10 runtime)
+dotnet publish src/RamDrive.Cli/RamDrive.Cli.csproj -c Release -r win-x64 \
+  -p:PublishAot=false --self-contained false -o ./publish-fx
 ```
 
 **Prerequisites:** .NET 10 SDK, [WinFsp](https://winfsp.dev/rel/) 2.x (install with Developer files).
+
+## Deployment
+
+Two publish flavours; both need WinFsp on the machine that runs them.
+
+| Kind | Output | Runs on |
+|------|--------|---------|
+| **AOT** (default, what CI releases) | self-contained single `RamDrive.exe` in `publish-aot/`; needs VS C++ Build Tools + `vswhere` to build | any x64 Windows 10+ — nothing else required |
+| **Framework-dependent** | `RamDrive.exe` apphost + `RamDrive.dll` / `RamDrive.Core.dll` + `Microsoft.Extensions.*` / `WinFsp.Native.dll` in `publish-fx/`; built with `-p:PublishAot=false --self-contained false` | x64 Windows 10+ **with the .NET 10 runtime installed** |
+
+ARM64 legs use `-r win-arm64` and the `-arm64` folder (`publish-aot-arm64/`, `publish-fx-arm64/`);
+CI builds both AOT legs. The framework-dependent folder is directly runnable — `publish-fx\RamDrive.exe`
+— and reads `appsettings.jsonc` from its own directory (see "Where the configuration actually lives"
+in `README.md`). To run it as a service instead of a console app, use
+`scripts\RamDrive-Service.ps1 install` (see **Windows Service** below).
+
+**Installer** (`setup/RamDrive.iss`, Inno Setup 6) packages either flavour through a preprocessor
+switch; the default is unchanged, so CI keeps producing AOT installers:
+
+```
+ISCC.exe setup\RamDrive.iss                          ; AOT → RamDrive-<ver>-x64-setup.exe
+ISCC.exe /DDeployKind=framework setup\RamDrive.iss   ; fx  → RamDrive-<ver>-x64-fx-setup.exe
+```
+
+Both legs also need `setup/winfsp-2.1.25156.msi` (CI downloads it; the file is gitignored locally).
+The framework leg compiles a .NET 10 runtime check into `InitializeSetup` and refuses to install when
+it fails — a silent install on a machine without the runtime would register a service that can never
+mount anything. Installer builds are **not** part of the normal local loop; plain `dotnet publish` is
+enough to run the app.
 
 ## Architecture
 
@@ -38,10 +71,12 @@ PagedFileContent (per-file nint[] page table + ReaderWriterLockSlim)
 PagePool (NativeMemory.AllocZeroed + ConcurrentStack<nint> free list)
 ```
 
-The WinFsp binding is provided by the [`WinFsp.Native`](https://www.nuget.org/packages/WinFsp.Native) NuGet package (namespace `WinFsp.Native`), which offers:
+The WinFsp binding is **vendored in-repo at [`src/WinFsp.Native`](src/WinFsp.Native)** (namespace `WinFsp.Native`), copied from [`WinFsp.Native`](https://www.nuget.org/packages/WinFsp.Native) 0.1.3-pre.1 (commit `5a0dd4d`, MIT). It offers:
 - `FileSystemHost` — high-level host bridging `IFileSystem` to native WinFsp
 - `WinFspFileSystem` — low-level API for direct function pointer manipulation
 - Full AOT-compatible P/Invoke layer with `[LibraryImport]` source generators
+
+The vendored copy must stay byte-identical to upstream apart from blocks marked `VENDORED DELTA` (grep that token before upgrading). The one functional delta is reparse name resolution: the NuGet package leaves interface slot 19 `ResolveReparsePoints` unwired, so links can be created but never followed; the vendored host wires slot 19 (delegating to WinFsp's exported `FspFileSystemResolveReparsePoints` / `FspFileSystemFindReparsePoint`) and adds `IFileSystem.GetReparsePointByName`. Do NOT switch back to the NuGet package until upstream wires slot 19.
 
 **All file data lives in NativeMemory (outside GC heap).** This is the core design decision — zero GC pressure for I/O operations.
 
@@ -61,6 +96,7 @@ The WinFsp binding is provided by the [`WinFsp.Native`](https://www.nuget.org/pa
   2. No lock: batch-allocate pages from PagePool via `RentBatch`. On failure return pages and report DISK_FULL.
   3. Write lock: assign page table entries + memcpy only. Race fallback: if a page was allocated by a concurrent writer between Phase 1 and 3, use single `Rent()`.
 - **Sparse SetLength**: extending a file only expands the page table (`nint.Zero` entries); no pages are reserved or allocated. Pages are allocated on demand in Write.
+- **Write grows the logical length** to the end of the written span (`_length = endOffset` when larger). Callers that must not extend a file have to clip their span to the logical length first — writing a whole page past EOF is exactly what padded every non-page-aligned file after a capacity/page-size reload (`docs/reload-null-padding-postmortem.md`).
 - Full protocol verified with TLA+ — see `tla/RamDiskSystem.tla`.
 - `ReaderWriterLockSlim` per file — concurrent reads don't block each other
 - Truncation zeros partial page data and batch-returns freed pages
@@ -68,6 +104,7 @@ The WinFsp binding is provided by the [`WinFsp.Native`](https://www.nuget.org/pa
 ### RamFileSystem (FileSystem/RamFileSystem.cs)
 - Single global `_structureLock` for all tree mutations (create/delete/move)
 - `Dictionary<string, FileNode>` with `StringComparer.OrdinalIgnoreCase` for Windows paths
+- `CreateSnapshot`/`RestoreSnapshot` back the config-change reload (spec `volume-reload`). Restore replays **only the bytes inside `snap.Length`**: a snapshot entry carries a whole page, and `PagedFileContent.Write` extends the length to the written span — replaying the page verbatim padded every non-page-aligned file to the page boundary after a capacity-only edit. Any future restore path must keep this rule.
 - Path format: backslash separated, root is `"\"`
 
 ### WinFspRamAdapter (RamDrive.Cli/WinFspRamAdapter.cs)
@@ -86,6 +123,7 @@ The WinFsp binding is provided by the [`WinFsp.Native`](https://www.nuget.org/pa
 - `ReadDirectory` uses native buffer with `WinFspFileSystem.AddDirInfo` / `EndDirInfo` — no IEnumerable allocation.
 - `SetMountPointEx` crashes on `"R:\"` (trailing backslash). Mount point format: `"R:"` = `DefineDosDevice` (invisible to disk tools), `"\\.\R:"` = Mount Manager (visible to all apps, requires admin or `MountUseMountmgrFromFSD=1` registry key). `WinFspHostedService` tries `\\.\R:` first, falls back to `R:` on failure.
 - **STATUS_PENDING async**: Must build a fresh stack-allocated `FspTransactRsp` with `Size`/`Kind`/`Hint` fields. Do NOT reuse `OperationContext->Response` — it may be invalidated after returning `STATUS_PENDING`. Save `Request->Hint` before returning, echo it back in the response.
+- **Reparse points (symlinks/junctions)**: on WinFsp 2.x name resolution is user-mode: the DLL calls slot 19 `ResolveReparsePoints` during Create/Open access checks and `FspFileSystemFindReparsePoint` from `GetSecurityByName` (memfs returns `STATUS_REPARSE` on a suffix hit when the exact name is missing). Store the opaque buffer on the node; never parse target names in managed code — forward to WinFsp's exported helpers. Set/Delete rules are memfs-lockstep: non-empty directory → `DIRECTORY_NOT_EMPTY`; tag/GUID mismatch → `IO_REPARSE_TAG_MISMATCH` / `REPARSE_ATTRIBUTE_CONFLICT` (see `ReparsePointBuffer.CanReplace`). Spec: `reparse-points`.
 - **Test mounts must use UNC paths** (`host.Prefix = @"\winfsp-tests\name"`; `host.Mount(null)`), not drive letters. Drive letter mounts become zombie on process crash and hang Explorer/entire system.
 - Detailed WinFsp binding design documented in the [`winfsp-native`](https://github.com/hooyao/winfsp-native) repository.
 
@@ -93,6 +131,11 @@ The WinFsp binding is provided by the [`WinFsp.Native`](https://www.nuget.org/pa
 
 ### Unit Tests (`tests/RamDrive.Core.Tests/`)
 Standard xUnit tests for core data structures (PagePool, PagedFileContent, RamFileSystem).
+
+`ReloadSnapshotTests` covers the config-reload snapshot/restore round trip. Assert metadata
+(`Size`/`Length`, `AllocatedBytes`, timestamps) directly, and with values that are *not* page-aligned:
+a wrong length is invisible to `Read`-based assertions because `Read` clamps to the logical length
+(`docs/reload-null-padding-postmortem.md` §3).
 
 ### Integration Tests (`tests/RamDrive.IntegrationTests/`)
 Self-hosted WinFsp integration tests. The test fixture boots its own `FileSystemHost` with UNC mount (`\\winfsp-tests\itest-{pid}`) — no external drive letter needed, safe on crash.
@@ -200,25 +243,59 @@ Release-only flags (in `RamDrive.Cli.csproj` under `Release` condition):
 
 The same `RamDrive.exe` runs as both a console app and a Windows Service. `UseWindowsService()` auto-detects the execution context. Console mode uses `SimpleConsole` logging; service mode additionally writes to Windows EventLog (`Application` log, source `RamDrive`).
 
+`scripts/RamDrive-Service.ps1` (+ its double-click launcher `scripts/RamDrive-Service.cmd`) is the
+canonical way to register a **published build** without the installer. Three entry points, one
+registration path:
+
+- `stage` (run from the repo): builds the copy-me folder `<publish folder>\RamDrive\` = payload +
+  both scripts + an `appsettings.jsonc` **inherited from the currently installed copy**, so an upgrade
+  keeps MountPoint / CapacityMb / InitialDirectories (the installer preserves the same three fields).
+  Copy it to `C:\Program Files\`, then double-click `RamDrive-Service.cmd` inside it.
+- Double-clicked from a folder that already contains `RamDrive.exe`: the launcher self-elevates and
+  shows a one-letter menu — `I` install (default) / `U` uninstall / `R` restart / `S` status — then
+  registers the service **in place, against that folder** (nothing is copied).
+- Command line: `status`, `install [-Source <folder>] [-Target <folder>] [-NoCopy]`, `restart`,
+  `uninstall`. Passing `-Target` explicitly is what selects copy mode; otherwise the folder is
+  registered in place (explicit `-Source` = register that folder). `uninstall` asks for confirmation,
+  because removing the service unmounts the drive and everything on it is lost.
+
+It reproduces the installer's parameters exactly — `start= auto`, `LocalSystem`, DisplayName
+`RamDrive RAM Disk`, the description, failure recovery (`restart/5000/restart/10000/restart/30000`
+with a 60 s reset window), `Group = "FSFilter Activity Monitor"` for early boot, and
+`HKLM\SOFTWARE\WOW6432Node\WinFsp\MountUseMountmgrFromFSD = 1` (without it the mount is
+DefineDosDevice-only and invisible to disk tools).
+
+Two invariants that script enforces, worth preserving in any future service tooling:
+
+- **The service binary must not live on the drive the service mounts.** Windows must read the binary
+  before the service runs; the drive only exists after it runs. `Assert-NotSelfHosted` refuses such an
+  install — a real hazard here, because a scratch checkout may itself sit on the RAM disk.
+- **Copy before stopping the old service.** The source folder may be on the RAM disk, so stopping
+  first would delete the files mid-copy. Same ordering rationale as WinFsp-before-unmount in the
+  installer (`PrepareToInstall`).
+
+Raw `sc.exe` equivalent (what the script ends up doing, minus the guards):
+
 ```powershell
 # Register (one-time, admin)
-sc.exe create RamDrive binPath= "C:\path\to\RamDrive.exe" start= auto
+sc.exe create RamDrive "binPath= C:\Program Files\RamDrive\RamDrive.exe" start= auto DisplayName= "RamDrive RAM Disk"
 sc.exe failure RamDrive reset= 60 actions= restart/5000/restart/10000/restart/30000
 
 # Unregister
 sc.exe stop RamDrive & sc.exe delete RamDrive
 ```
 
-The installer handles registration/unregistration automatically.
+The installer handles registration/unregistration automatically with the same parameters.
 
 ## Installer (`setup/RamDrive.iss`)
 
-Inno Setup 6.7+ script that produces a single `RamDrive-X.Y.Z-setup.exe`. Requires [Inno Setup](https://jrsoftware.org/isinfo.php) and the WinFsp MSI in `setup/`.
+Inno Setup 6.7+ script that produces the installers. Requires [Inno Setup](https://jrsoftware.org/isinfo.php) and the WinFsp MSI in `setup/`. Two preprocessor switches select what gets packaged — `MyAppArch` (x64 default / arm64) and `DeployKind` (`aot` default / `framework`, which packages `publish-fx/` instead of `publish-aot/`; see **Deployment** above).
 
 ```bash
 # Local build (requires Inno Setup installed, WinFsp MSI in setup/, AOT output in publish-aot/)
-ISCC.exe setup/RamDrive.iss
-# Output: installer-output/RamDrive-{version}-setup.exe
+ISCC.exe setup/RamDrive.iss                          # → installer-output/RamDrive-{version}-x64-setup.exe
+ISCC.exe /DMyAppArch=arm64 setup/RamDrive.iss        # → installer-output/RamDrive-{version}-arm64-setup.exe
+ISCC.exe /DDeployKind=framework setup/RamDrive.iss   # → installer-output/RamDrive-{version}-x64-fx-setup.exe
 ```
 
 **Three install types:** Full (RamDrive + WinFsp + Windows Service), Green/Portable (exe only), Custom.
@@ -268,5 +345,8 @@ All settings in `appsettings.jsonc` under `"RamDrive"` section, overridable via 
 | PreAllocate | false | true = allocate all memory at startup |
 | VolumeLabel | RamDrive | Explorer display name |
 | EnableKernelCache | true | Master switch for the WinFsp kernel `FileInfo` cache. `false` forces `FileInfoTimeoutMs` to `0` regardless of its configured value (backout switch; ~3× lower throughput). |
-| FileInfoTimeoutMs | 1000 | Kernel `FileInfo` cache lifetime (ms). The adapter invalidates the cache explicitly via `FspFileSystemNotify` on every path-mutating callback (see `WinFspRamAdapter.cs` notification matrix); this timeout is defence in depth. `0` disables the cache; `uint.MaxValue` makes it permanent (trust notifications only — the integration test fixture pins this value to catch regressions). |
+| FileInfoTimeoutMs | 1000 | Kernel `FileInfo` cache lifetime (ms). Coherence relies on **every callback returning the correct post-operation `FspFileInfo`** (the kernel updates `Cc` from it); this timeout bounds how long a stale entry a callback failed to correct can survive. `0` disables the cache; `uint.MaxValue` makes it permanent. |
+| EnableNotifications | true | Send `FspFileSystemNotify` after every path-mutating callback (Create / Write / SetFileSize / SetFileAttributes / Rename / Delete). **Default on**: `MoveFile`, `Cleanup` and `CanDelete` return no `FspFileInfo`, so for those the notification is the only signal the kernel gets that a cached entry for a path is stale — this is what implements `specs/cache-invalidation` and fixed the Chrome/leveldb profile corruption. Costs one kernel IOCTL per mutation, dispatched off the WinFsp dispatcher thread. Set `false` only if a metadata-heavy workload measurably regresses. |
 | InitialDirectories | `{}` | Tree of directories to create on mount (e.g. `{ "Temp": {} }`) |
+
+**Configuration invariant** — `Validate()` refuses the combination `EnableKernelCache=true` + `EnableNotifications=false` + `FileInfoTimeoutMs=uint.MaxValue`. With a permanent cache and no notifications, cached metadata for a path never expires *and* nothing invalidates it, which is exactly the leveldb/Chromium failure mode documented in `docs/leveldb-cache-coherency-postmortem.md`. The integration fixtures pin `uint.MaxValue`, so they must keep notifications on to satisfy this rule.
