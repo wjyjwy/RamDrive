@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/WinFsp.Native/WinFsp.Native.csproj" />
     <Project Path="src/RamDrive.Core/RamDrive.Core.csproj" />
     <Project Path="src/RamDrive.Cli/RamDrive.Cli.csproj" />
     <Project Path="src/RamDrive.Diagnostics.MemfsReference/RamDrive.Diagnostics.MemfsReference.csproj" />

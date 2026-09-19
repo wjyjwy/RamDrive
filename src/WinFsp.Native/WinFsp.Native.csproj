@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <IsAotCompatible>true</IsAotCompatible>
+        <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+        <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+        <RootNamespace>WinFsp.Native</RootNamespace>
+        <!--
+          Vendored from https://github.com/hooyao/winfsp-native (MIT, Copyright (c) 2026 Hu Yao),
+          exact commit 5a0dd4d4888dcccaf355127faeed804d2b7f3875 (= NuGet WinFsp.Native 0.1.3-pre.1).
+
+          Why vendored instead of PackageReferenced: the released package leaves the
+          FSP_FILE_SYSTEM_INTERFACE.ResolveReparsePoints slot (slot 19) unset. On WinFsp 2.x
+          symbolic links / junctions cannot be traversed without that callback — the user-mode
+          DLL is the reparse-name resolver. The local delta wires slot 19 (plus the
+          FspFileSystemFindReparsePoint call from the GetSecurityByName shim) and adds the
+          IFileSystem.GetReparsePointByName member. Keep this copy otherwise byte-identical
+          to upstream so future syncs are mechanical. Search for "VENDORED DELTA" in this
+          project to find every deviation.
+        -->
+    </PropertyGroup>
+
+</Project>

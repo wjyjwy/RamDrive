@@ -47,7 +47,7 @@ public class IFileSystemContractTests
         // contract still treats them as "declared" so won't fail on those.
         // The point: many other interface members (SetVolumeLabel, OverwriteFile,
         // FlushFileBuffers, GetFileInformation, SetFileAttributes, SetFileSize,
-        // MoveFile, GetReparsePoint, SetReparsePoint, DeleteReparsePoint,
+        // MoveFile, GetReparsePoint, GetReparsePointByName, SetReparsePoint, DeleteReparsePoint,
         // GetStreamInfo, GetEa, SetEa, DeviceControl, GetDirInfoByName,
         // ExceptionHandler, Init, Mounted, Unmounted, DispatcherStopped, Cleanup,
         // Close, GetFileSecurity, SetFileSecurity) are inherited from interface

@@ -5,6 +5,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <SupportedPlatform>windows</SupportedPlatform>
         <IsTestProject>true</IsTestProject>
     </PropertyGroup>
 
@@ -13,7 +14,7 @@
         <PackageReference Include="xunit"/>
         <PackageReference Include="xunit.runner.visualstudio"/>
         <PackageReference Include="FluentAssertions"/>
-        <PackageReference Include="WinFsp.Native"/>
+        <ProjectReference Include="..\..\src\WinFsp.Native\WinFsp.Native.csproj" />
     </ItemGroup>
 
     <ItemGroup>

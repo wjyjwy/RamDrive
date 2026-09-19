@@ -10,7 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="WinFsp.Native" />
+    <ProjectReference Include="..\WinFsp.Native\WinFsp.Native.csproj" />
   </ItemGroup>
 
   <ItemGroup>

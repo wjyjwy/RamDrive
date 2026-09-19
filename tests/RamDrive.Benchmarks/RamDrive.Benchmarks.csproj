@@ -6,6 +6,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <SupportedPlatform>windows</SupportedPlatform>
     </PropertyGroup>
 
     <ItemGroup>
@@ -13,7 +14,7 @@
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Include="WinFsp.Native" />
+        <ProjectReference Include="..\..\src\WinFsp.Native\WinFsp.Native.csproj" />
     </ItemGroup>
 
     <ItemGroup>
