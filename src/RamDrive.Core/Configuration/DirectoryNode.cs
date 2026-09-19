@@ -61,6 +61,26 @@ public sealed class DirectoryNode : Dictionary<string, DirectoryNode>
                 errors.Add($"  - \"{displayPath}\": name exceeds 255 characters");
             }
 
+            bool hasControlChar = false;
+            foreach (char c in name)
+            {
+                if (c < ' ' || c == '\u007F')
+                {
+                    hasControlChar = true;
+                    break;
+                }
+            }
+
+            if (!nameInvalid && hasControlChar)
+            {
+                errors.Add($"  - \"{displayPath}\": contains control character(s)");
+            }
+
+            if (!nameInvalid && (name.EndsWith('.') || name.EndsWith(' ')))
+            {
+                errors.Add($"  - \"{displayPath}\": ends with '.' or ' ' (invalid on Windows)");
+            }
+
             // Always validate children so the user sees all errors at once
             if (children.Count > 0)
                 ValidateRecursive(children, displayPath, errors, depth + 1);
@@ -69,8 +89,15 @@ public sealed class DirectoryNode : Dictionary<string, DirectoryNode>
 
     private static bool IsReservedName(string name)
     {
-        var upper = name.ToUpperInvariant();
-        upper = upper.TrimEnd('.', ' ');
+        // MUST match WindowsNameRules.IsReservedBaseName: a reserved device name is
+        // reserved with ANY extension, so "CON.txt" must be rejected too. Previously
+        // this only trimmed trailing '.'/' ' and never cut at the first '.', so a config
+        // entry like "CON.txt" passed config-time validation and was then silently
+        // refused by RamFileSystem.CreateDirectory (WindowsNameRules) — a directory the
+        // user asked for simply never appeared. Keep both rule sets identical.
+        var upper = name.TrimEnd('.', ' ').ToUpperInvariant();
+        int dot = upper.IndexOf('.');
+        if (dot >= 0) upper = upper[..dot];
         return upper is "CON" or "PRN" or "AUX" or "NUL"
             or "COM1" or "COM2" or "COM3" or "COM4" or "COM5" or "COM6" or "COM7" or "COM8" or "COM9"
             or "LPT1" or "LPT2" or "LPT3" or "LPT4" or "LPT5" or "LPT6" or "LPT7" or "LPT8" or "LPT9";

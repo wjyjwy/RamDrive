@@ -62,6 +62,23 @@ public class DirectoryNodeValidationTests
     }
 
     [Fact]
+    public void ReservedNameWithExtension_ReportsError()
+    {
+        // Parity with WindowsNameRules.IsValid: a reserved device name is reserved with
+        // ANY extension, so the config validator must reject "CON.txt" too. It previously
+        // did not, so such an entry passed config validation and was then silently refused
+        // by RamFileSystem.CreateDirectory — the directory simply never appeared.
+        var node = new DirectoryNode
+        {
+            ["CON.txt"] = new DirectoryNode()
+        };
+
+        var errors = node.Validate();
+        errors.Should().ContainSingle()
+            .Which.Should().Contain("reserved name");
+    }
+
+    [Fact]
     public void EmptyName_ReportsError()
     {
         var node = new DirectoryNode
